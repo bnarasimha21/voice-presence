@@ -1,7 +1,15 @@
-import { personas } from "@/lib/personas";
+import { personas, type PersonaId } from "@/lib/personas";
 import { VoiceChat } from "@/components/VoiceChat";
 
-// For V1, default to Narsi. Later: read from URL params to switch personas.
-export default function TalkPage() {
-  return <VoiceChat persona={personas.narsi} />;
+export default async function TalkPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ persona?: string }>;
+}) {
+  const { persona: personaParam } = await searchParams;
+  const personaId = (personaParam as PersonaId) in personas
+    ? (personaParam as PersonaId)
+    : "narsi";
+
+  return <VoiceChat persona={personas[personaId]} />;
 }

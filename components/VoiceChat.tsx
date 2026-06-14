@@ -95,10 +95,11 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     recorder.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
 
-      // PLACEHOLDER: Replace with Deepgram STT call
-      // const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-      // const transcript = await transcribeWithDeepgram(blob);
-      const transcript = "[PLACEHOLDER — wire up Deepgram STT here]";
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      const res = await fetch("/api/stt", { method: "POST", body: blob });
+      if (!res.ok) { setStatus("idle"); return; }
+      const { transcript } = await res.json();
+      if (!transcript?.trim()) { setStatus("idle"); return; }
 
       await sendMessage(transcript);
     };
