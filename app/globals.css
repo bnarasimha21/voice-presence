@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #07070b;
+  --foreground: #ededed;
 }
 
 @theme inline {
@@ -12,15 +12,188 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ---------------------------------------------------------------------------
+   Calm voice orb
+   --------------------------------------------------------------------------- */
+
+/* Ambient backdrop: a soft colored glow that drifts behind the orb. */
+.orb-stage {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(60% 50% at 50% 38%, rgba(99, 102, 241, 0.14), transparent 70%),
+    radial-gradient(40% 40% at 70% 75%, rgba(219, 39, 119, 0.08), transparent 70%),
+    var(--background);
+}
+
+.orb {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.orb:disabled {
+  cursor: default;
+}
+
+/* The glowing core. Scales with live mic level via --level (0..1). */
+.orb-core {
+  width: 150px;
+  height: 150px;
+  border-radius: 9999px;
+  background: radial-gradient(circle at 34% 28%, #93c5fd, #6366f1 52%, #4338ca 100%);
+  box-shadow:
+    0 0 50px 8px rgba(99, 102, 241, 0.4),
+    inset 0 0 45px rgba(255, 255, 255, 0.14);
+  transform: scale(calc(1 + var(--level, 0) * 0.28));
+  transition: transform 0.12s ease-out, box-shadow 0.5s ease, background 0.6s ease;
+}
+
+/* Idle: slow breathing. */
+.orb[data-status="idle"] .orb-core {
+  animation: orb-breathe 5s ease-in-out infinite;
+}
+@keyframes orb-breathe {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 40px 6px rgba(99, 102, 241, 0.32), inset 0 0 45px rgba(255, 255, 255, 0.12);
+  }
+  50% {
+    transform: scale(1.06);
+    box-shadow: 0 0 75px 16px rgba(99, 102, 241, 0.5), inset 0 0 45px rgba(255, 255, 255, 0.18);
+  }
+}
+
+/* Listening: warmer, brighter; size is driven live by --level. */
+.orb[data-status="listening"] .orb-core {
+  background: radial-gradient(circle at 34% 28%, #c7d2fe, #6366f1 48%, #db2777 120%);
+  box-shadow:
+    0 0 90px 22px rgba(219, 39, 119, 0.4),
+    inset 0 0 45px rgba(255, 255, 255, 0.22);
+}
+
+/* Thinking: dim, slow shimmer. */
+.orb[data-status="thinking"] .orb-core {
+  animation: orb-think 1.6s ease-in-out infinite;
+  filter: saturate(0.7);
+}
+@keyframes orb-think {
+  0%, 100% { transform: scale(0.96); opacity: 0.7; }
+  50% { transform: scale(1.0); opacity: 1; }
+}
+
+/* Speaking: lively pulse. */
+.orb[data-status="speaking"] .orb-core {
+  background: radial-gradient(circle at 34% 28%, #a5f3fc, #22d3ee 45%, #6366f1 110%);
+  animation: orb-speak 1.1s ease-in-out infinite;
+}
+@keyframes orb-speak {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 55px 10px rgba(34, 211, 238, 0.4), inset 0 0 45px rgba(255, 255, 255, 0.2);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow: 0 0 95px 22px rgba(34, 211, 238, 0.6), inset 0 0 45px rgba(255, 255, 255, 0.28);
+  }
+}
+
+/* Concentric ripple rings — only emanate while listening. */
+.orb-ring {
+  position: absolute;
+  width: 150px;
+  height: 150px;
+  border-radius: 9999px;
+  border: 1px solid rgba(199, 210, 254, 0.5);
+  opacity: 0;
+  pointer-events: none;
+}
+.orb[data-status="listening"] .orb-ring {
+  animation: orb-ripple 2.4s ease-out infinite;
+}
+.orb[data-status="listening"] .orb-ring.delay {
+  animation-delay: 1.2s;
+}
+@keyframes orb-ripple {
+  0% { transform: scale(1); opacity: 0.45; }
+  100% { transform: scale(2.1); opacity: 0; }
+}
+
+/* Caption fade-in. */
+.caption-in {
+  animation: caption-fade 0.5s ease both;
+}
+@keyframes caption-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------------------------------------------------------------------------
+   Chat transcript — distinct visuals for Abhi vs the user
+   --------------------------------------------------------------------------- */
+
+/* Soft top fade so messages dissolve as they scroll up toward the orb. */
+.transcript {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 36px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 36px);
+}
+
+/* Abhi's avatar — a mini version of the orb. */
+.msg-orb {
+  width: 22px;
+  height: 22px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+  background: radial-gradient(circle at 34% 28%, #c7d2fe, #6366f1 60%, #4338ca 100%);
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.55);
+}
+
+.bubble {
+  max-width: 78%;
+  padding: 0.5rem 0.85rem;
+  border-radius: 1.1rem;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+/* Abhi: indigo glass, tail on the left. */
+.bubble-abhi {
+  background: rgba(99, 102, 241, 0.13);
+  border: 1px solid rgba(129, 140, 248, 0.24);
+  color: #eef2ff;
+  border-bottom-left-radius: 0.35rem;
+}
+
+/* User: neutral, tail on the right. */
+.bubble-user {
+  background: rgba(40, 40, 46, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: #e7e7ea;
+  border-bottom-right-radius: 0.35rem;
+}
+
+/* Abhi's latest bubble glows while he speaks. */
+.bubble-speaking {
+  animation: bubble-glow 1.4s ease-in-out infinite;
+}
+@keyframes bubble-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); border-color: rgba(129, 140, 248, 0.24); }
+  50% { box-shadow: 0 0 18px 1px rgba(34, 211, 238, 0.38); border-color: rgba(34, 211, 238, 0.45); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-core, .orb-ring, .bubble-speaking { animation: none !important; }
 }

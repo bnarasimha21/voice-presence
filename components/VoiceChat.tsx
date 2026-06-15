@@ -4,28 +4,68 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import type { Persona } from "@/lib/personas";
 import type { Message } from "@/lib/claude";
 
-// NOTE: Deepgram browser SDK handles real-time STT via WebSocket.
-// Install: npm install @deepgram/sdk
-// Deepgram API key is passed from server via /api/deepgram-token (to avoid exposing in client)
-
 type Status = "idle" | "listening" | "thinking" | "speaking";
 
 export function VoiceChat({ persona }: { persona: Persona }) {
   const [status, setStatus] = useState<Status>("idle");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [liveTranscript, setLiveTranscript] = useState("");
   const [lastReply, setLastReply] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const orbRef = useRef<HTMLButtonElement | null>(null);
+
+  // Web Audio plumbing for live mic-level reactivity on the orb.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const rafRef = useRef<number | null>(null);
 
   // Keep the conversation scrolled to the newest message as it grows.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, lastReply, liveTranscript]);
+  }, [messages, lastReply]);
+
+  // Drive --level (0..1) on the orb from the mic's volume while listening.
+  const startLevelMeter = useCallback((stream: MediaStream) => {
+    try {
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = new Ctx();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      audioCtxRef.current = ctx;
+
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length / 255; // 0..1
+        orbRef.current?.style.setProperty(
+          "--level",
+          String(Math.min(1, avg * 1.9))
+        );
+        rafRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch {
+      // Audio-reactivity is a nice-to-have; never block recording on it.
+    }
+  }, []);
+
+  const stopLevelMeter = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    orbRef.current?.style.setProperty("--level", "0");
+  }, []);
 
   const stopSpeaking = useCallback(() => {
     if (audioRef.current) {
@@ -45,7 +85,10 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         body: JSON.stringify({ text, personaId: persona.id }),
       });
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        setStatus("idle");
+        return;
+      }
 
       const audioBlob = await res.blob();
       const url = URL.createObjectURL(audioBlob);
@@ -56,7 +99,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         setStatus("idle");
         URL.revokeObjectURL(url);
       };
-      audioRef.current.play();
+      audioRef.current.play().catch(() => setStatus("idle"));
     },
     [persona.id]
   );
@@ -70,7 +113,6 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         { role: "user", content: userText },
       ];
       setMessages(newMessages);
-      setLiveTranscript("");
       setStatus("thinking");
 
       const res = await fetch("/api/chat", {
@@ -87,40 +129,44 @@ export function VoiceChat({ persona }: { persona: Persona }) {
   );
 
   const startListening = useCallback(async () => {
-    // Stop any ongoing speech (barge-in)
-    stopSpeaking();
+    stopSpeaking(); // barge-in: cut off Abhi if he's mid-sentence
     setStatus("listening");
     chunksRef.current = [];
 
-    // TODO: Replace with Deepgram real-time WebSocket for live transcript
-    // For now using MediaRecorder as a placeholder — sends on stop
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    startLevelMeter(stream);
+
     const recorder = new MediaRecorder(stream);
     mediaRecorderRef.current = recorder;
 
     recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
     recorder.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
+      stopLevelMeter();
 
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       const res = await fetch("/api/stt", { method: "POST", body: blob });
-      if (!res.ok) { setStatus("idle"); return; }
+      if (!res.ok) {
+        setStatus("idle");
+        return;
+      }
       const { transcript } = await res.json();
-      if (!transcript?.trim()) { setStatus("idle"); return; }
-
+      if (!transcript?.trim()) {
+        setStatus("idle");
+        return;
+      }
       await sendMessage(transcript);
     };
 
     recorder.start();
-  }, [sendMessage, stopSpeaking]);
+  }, [sendMessage, stopSpeaking, startLevelMeter, stopLevelMeter]);
 
   const stopListening = useCallback(() => {
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
   }, []);
 
-  // Toggle: start recording if idle/speaking, stop & send if already listening.
-  // (Avoids the press-and-hold race where mouseUp fires before getUserMedia resolves.)
+  // Toggle: start if idle/speaking, stop & send if already listening.
   const toggleMic = useCallback(() => {
     if (status === "listening") {
       stopListening();
@@ -129,11 +175,10 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     }
   }, [status, startListening, stopListening]);
 
-  // Spacebar: press once to enable mic, press again to send.
+  // Spacebar: press once to start, press again to send.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code !== "Space" || e.repeat) return;
-      // Ignore if typing in an input/textarea/contenteditable.
       const el = e.target as HTMLElement;
       if (
         el.tagName === "INPUT" ||
@@ -141,80 +186,102 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         el.isContentEditable
       )
         return;
-      e.preventDefault(); // stop the page from scrolling
+      e.preventDefault();
       toggleMic();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleMic]);
 
-  const statusLabel: Record<Status, string> = {
-    idle: "Tap or press space to talk",
-    listening: "Listening... (tap or space to send)",
-    thinking: "...",
-    speaking: "Speaking",
-  };
+  // Tear down audio plumbing on unmount.
+  useEffect(() => stopLevelMeter, [stopLevelMeter]);
+
+  // The line shown softly beneath the orb, by state.
+  const caption =
+    status === "listening"
+      ? "Listening…"
+      : status === "thinking"
+        ? "Thinking…"
+        : status === "speaking"
+          ? lastReply
+          : messages.length === 0
+            ? "So—what's on your mind?"
+            : "Tap the orb or press space";
+
+  const hint =
+    status === "listening"
+      ? "tap or press space to send"
+      : status === "thinking"
+        ? ""
+        : "tap the orb · or press space";
 
   return (
-    <div className="flex flex-col h-screen bg-neutral-950 text-white">
+    <div className="orb-stage flex flex-col h-screen text-white overflow-hidden">
       {/* Persona header */}
-      <div className="flex flex-col items-center gap-2 pt-8 pb-4 shrink-0">
-        <div className="w-16 h-16 rounded-full bg-neutral-800 overflow-hidden">
-          <img
-            src={persona.avatarUrl}
-            alt={persona.name}
-            className="w-full h-full object-cover"
-            onError={(e) =>
-              ((e.target as HTMLImageElement).style.display = "none")
-            }
-          />
-        </div>
-        <h1 className="text-xl font-semibold">{persona.name}</h1>
-        <p className="text-neutral-400 text-sm">{persona.tagline}</p>
-      </div>
+      <header className="flex flex-col items-center gap-1 pt-10 shrink-0">
+        <h1 className="text-lg font-medium tracking-wide">{persona.name}</h1>
+        <p className="text-neutral-500 text-xs">{persona.tagline}</p>
+      </header>
 
-      {/* Conversation history — scrollable, grows to fill, auto-scrolls to newest */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto w-full max-w-md mx-auto px-4 py-4 flex flex-col gap-3"
-      >
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            className={`text-sm px-4 py-2 rounded-2xl max-w-[80%] whitespace-pre-wrap ${
-              m.role === "user"
-                ? "bg-neutral-800 self-end text-right"
-                : "bg-neutral-900 self-start"
-            }`}
-          >
-            {m.content}
-          </div>
-        ))}
-
-        {/* Live transcript / in-flight reply, shown inline at the bottom */}
-        {status === "listening" && liveTranscript && (
-          <p className="italic text-neutral-400 self-end text-right max-w-[80%]">
-            {liveTranscript}
-          </p>
-        )}
-      </div>
-
-      {/* Mic controls — pinned at the bottom */}
-      <div className="flex flex-col items-center gap-3 py-6 shrink-0 border-t border-neutral-900">
+      {/* Orb — the centerpiece and the control */}
+      <main className="flex-1 flex flex-col items-center justify-center gap-10 px-6">
         <button
+          ref={orbRef}
           onClick={toggleMic}
           disabled={status === "thinking"}
-          className={`
-            w-20 h-20 rounded-full flex items-center justify-center text-3xl
-            transition-all duration-150 select-none
-            ${status === "listening" ? "bg-red-500 scale-110" : "bg-white text-black"}
-            ${status === "thinking" ? "opacity-40 cursor-not-allowed" : "cursor-pointer active:scale-95"}
-          `}
+          data-status={status}
+          aria-label={status === "listening" ? "Stop and send" : "Start talking"}
+          className="orb"
+          style={{ ["--level" as string]: 0 }}
         >
-          {status === "listening" ? "●" : "🎙"}
+          <span className="orb-ring" />
+          <span className="orb-ring delay" />
+          <span className="orb-core" />
         </button>
-        <p className="text-neutral-500 text-sm">{statusLabel[status]}</p>
-      </div>
+
+        <p
+          key={caption}
+          className="caption-in max-w-md text-center text-base text-neutral-200 min-h-7 px-4"
+        >
+          {caption}
+        </p>
+      </main>
+
+      {/* Conversation transcript — distinct bubbles per speaker, scrollable */}
+      {messages.length > 0 && (
+        <div
+          ref={scrollRef}
+          className="transcript shrink-0 w-full max-w-md mx-auto px-5 pt-3 pb-2 overflow-y-auto flex flex-col gap-3 max-h-[32vh]"
+        >
+          {messages.map((m, i) => {
+            const isAbhi = m.role === "assistant";
+            const isSpeakingNow =
+              isAbhi && status === "speaking" && i === messages.length - 1;
+            return (
+              <div
+                key={i}
+                className={`flex items-end gap-2 ${
+                  isAbhi ? "self-start" : "self-end flex-row-reverse"
+                }`}
+              >
+                {isAbhi && <span className="msg-orb" aria-hidden />}
+                <div
+                  className={`bubble ${
+                    isAbhi ? "bubble-abhi" : "bubble-user"
+                  } ${isSpeakingNow ? "bubble-speaking" : ""}`}
+                >
+                  {m.content}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Hint */}
+      <footer className="shrink-0 text-center pb-8 pt-3">
+        <p className="text-neutral-600 text-xs tracking-wide h-4">{hint}</p>
+      </footer>
     </div>
   );
 }
