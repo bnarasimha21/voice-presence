@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import type { Persona } from "@/lib/personas";
 import type { Message } from "@/lib/claude";
 
@@ -19,6 +19,13 @@ export function VoiceChat({ persona }: { persona: Persona }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the conversation scrolled to the newest message as it grows.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, lastReply, liveTranscript]);
 
   const stopSpeaking = useCallback(() => {
     if (audioRef.current) {
@@ -109,20 +116,50 @@ export function VoiceChat({ persona }: { persona: Persona }) {
 
   const stopListening = useCallback(() => {
     mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
   }, []);
 
+  // Toggle: start recording if idle/speaking, stop & send if already listening.
+  // (Avoids the press-and-hold race where mouseUp fires before getUserMedia resolves.)
+  const toggleMic = useCallback(() => {
+    if (status === "listening") {
+      stopListening();
+    } else if (status === "idle" || status === "speaking") {
+      startListening();
+    }
+  }, [status, startListening, stopListening]);
+
+  // Spacebar: press once to enable mic, press again to send.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || e.repeat) return;
+      // Ignore if typing in an input/textarea/contenteditable.
+      const el = e.target as HTMLElement;
+      if (
+        el.tagName === "INPUT" ||
+        el.tagName === "TEXTAREA" ||
+        el.isContentEditable
+      )
+        return;
+      e.preventDefault(); // stop the page from scrolling
+      toggleMic();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [toggleMic]);
+
   const statusLabel: Record<Status, string> = {
-    idle: "Tap to talk",
-    listening: "Listening...",
+    idle: "Tap or press space to talk",
+    listening: "Listening... (tap or space to send)",
     thinking: "...",
     speaking: "Speaking",
   };
 
   return (
-    <div className="flex flex-col items-center gap-8 p-8 min-h-screen bg-neutral-950 text-white">
+    <div className="flex flex-col h-screen bg-neutral-950 text-white">
       {/* Persona header */}
-      <div className="flex flex-col items-center gap-3 pt-8">
-        <div className="w-20 h-20 rounded-full bg-neutral-800 overflow-hidden">
+      <div className="flex flex-col items-center gap-2 pt-8 pb-4 shrink-0">
+        <div className="w-16 h-16 rounded-full bg-neutral-800 overflow-hidden">
           <img
             src={persona.avatarUrl}
             alt={persona.name}
@@ -132,56 +169,52 @@ export function VoiceChat({ persona }: { persona: Persona }) {
             }
           />
         </div>
-        <h1 className="text-2xl font-semibold">{persona.name}</h1>
+        <h1 className="text-xl font-semibold">{persona.name}</h1>
         <p className="text-neutral-400 text-sm">{persona.tagline}</p>
       </div>
 
-      {/* Live transcript */}
-      <div className="w-full max-w-md min-h-16 text-center text-neutral-300">
+      {/* Conversation history — scrollable, grows to fill, auto-scrolls to newest */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto w-full max-w-md mx-auto px-4 py-4 flex flex-col gap-3"
+      >
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={`text-sm px-4 py-2 rounded-2xl max-w-[80%] whitespace-pre-wrap ${
+              m.role === "user"
+                ? "bg-neutral-800 self-end text-right"
+                : "bg-neutral-900 self-start"
+            }`}
+          >
+            {m.content}
+          </div>
+        ))}
+
+        {/* Live transcript / in-flight reply, shown inline at the bottom */}
         {status === "listening" && liveTranscript && (
-          <p className="italic">{liveTranscript}</p>
-        )}
-        {status === "speaking" && lastReply && (
-          <p className="text-white">{lastReply}</p>
+          <p className="italic text-neutral-400 self-end text-right max-w-[80%]">
+            {liveTranscript}
+          </p>
         )}
       </div>
 
-      {/* Mic button */}
-      <button
-        onMouseDown={startListening}
-        onMouseUp={stopListening}
-        onTouchStart={startListening}
-        onTouchEnd={stopListening}
-        disabled={status === "thinking"}
-        className={`
-          w-24 h-24 rounded-full flex items-center justify-center text-3xl
-          transition-all duration-150 select-none
-          ${status === "listening" ? "bg-red-500 scale-110" : "bg-white text-black"}
-          ${status === "thinking" ? "opacity-40 cursor-not-allowed" : "cursor-pointer active:scale-95"}
-        `}
-      >
-        {status === "listening" ? "●" : "🎙"}
-      </button>
-
-      <p className="text-neutral-500 text-sm">{statusLabel[status]}</p>
-
-      {/* Conversation history (optional, can hide for a cleaner look) */}
-      {messages.length > 0 && (
-        <div className="w-full max-w-md space-y-3 mt-4">
-          {messages.slice(-6).map((m, i) => (
-            <div
-              key={i}
-              className={`text-sm px-4 py-2 rounded-2xl max-w-xs ${
-                m.role === "user"
-                  ? "bg-neutral-800 self-end ml-auto text-right"
-                  : "bg-neutral-900 self-start"
-              }`}
-            >
-              {m.content}
-            </div>
-          ))}
-        </div>
-      )}
+      {/* Mic controls — pinned at the bottom */}
+      <div className="flex flex-col items-center gap-3 py-6 shrink-0 border-t border-neutral-900">
+        <button
+          onClick={toggleMic}
+          disabled={status === "thinking"}
+          className={`
+            w-20 h-20 rounded-full flex items-center justify-center text-3xl
+            transition-all duration-150 select-none
+            ${status === "listening" ? "bg-red-500 scale-110" : "bg-white text-black"}
+            ${status === "thinking" ? "opacity-40 cursor-not-allowed" : "cursor-pointer active:scale-95"}
+          `}
+        >
+          {status === "listening" ? "●" : "🎙"}
+        </button>
+        <p className="text-neutral-500 text-sm">{statusLabel[status]}</p>
+      </div>
     </div>
   );
 }
