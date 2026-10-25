@@ -10,6 +10,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
   const [status, setStatus] = useState<Status>("idle");
   const [messages, setMessages] = useState<Message[]>([]);
   const [lastReply, setLastReply] = useState("");
+  const [ttsError, setTtsError] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -78,14 +79,25 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     async (text: string) => {
       setStatus("speaking");
       setLastReply(text);
+      setTtsError("");
 
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, personaId: persona.id }),
-      });
+      let res: Response;
+      try {
+        res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, personaId: persona.id }),
+        });
+      } catch (err) {
+        setTtsError(`Voice failed: ${err instanceof Error ? err.message : "network error"}`);
+        setStatus("idle");
+        return;
+      }
 
       if (!res.ok) {
+        // Surface the server's explanation (e.g. a missing voice id) instead of failing silently
+        const detail = (await res.text().catch(() => "")).trim().slice(0, 200);
+        setTtsError(`Voice failed (${res.status}): ${detail || res.statusText || "unknown error"}`);
         setStatus("idle");
         return;
       }
@@ -113,6 +125,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         { role: "user", content: userText },
       ];
       setMessages(newMessages);
+      setTtsError("");
       setStatus("thinking");
 
       const res = await fetch("/api/chat", {
@@ -198,7 +211,9 @@ export function VoiceChat({ persona }: { persona: Persona }) {
 
   // The line shown softly beneath the orb, by state.
   const caption =
-    status === "listening"
+    ttsError && status === "idle"
+      ? ttsError
+      : status === "listening"
       ? "Listening…"
       : status === "thinking"
         ? "Thinking…"
@@ -241,7 +256,9 @@ export function VoiceChat({ persona }: { persona: Persona }) {
 
         <p
           key={caption}
-          className="caption-in max-w-md text-center text-base text-neutral-200 min-h-7 px-4"
+          className={`caption-in max-w-md text-center text-base min-h-7 px-4 ${
+            ttsError && status === "idle" ? "text-red-400" : "text-neutral-200"
+          }`}
         >
           {caption}
         </p>
