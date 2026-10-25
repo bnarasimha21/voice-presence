@@ -20,12 +20,20 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const stream = await textToSpeechStream(text, persona.voiceId);
+  try {
+    const stream = await textToSpeechStream(text, persona.voiceId);
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "audio/mpeg",
-      "Transfer-Encoding": "chunked",
-    },
-  });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "audio/mpeg",
+        "Transfer-Encoding": "chunked",
+      },
+    });
+  } catch (err) {
+    console.error("TTS failed:", err);
+    return new Response("Text to speech failed. Please try again.", {
+      status: 502,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
 }

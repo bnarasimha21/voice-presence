@@ -90,7 +90,8 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         });
       } catch (err) {
         setTtsError(`Voice failed: ${err instanceof Error ? err.message : "network error"}`);
-        setStatus("idle");
+        // Do not clobber a recording the user started while the request was in flight
+        setStatus((s) => (s === "listening" ? s : "idle"));
         return;
       }
 
@@ -98,7 +99,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         // Surface the server's explanation (e.g. a missing voice id) instead of failing silently
         const detail = (await res.text().catch(() => "")).trim().slice(0, 200);
         setTtsError(`Voice failed (${res.status}): ${detail || res.statusText || "unknown error"}`);
-        setStatus("idle");
+        setStatus((s) => (s === "listening" ? s : "idle"));
         return;
       }
 
@@ -111,7 +112,10 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         setStatus("idle");
         URL.revokeObjectURL(url);
       };
-      audioRef.current.play().catch(() => setStatus("idle"));
+      audioRef.current.play().catch(() => {
+        setTtsError("Audio could not play");
+        setStatus((s) => (s === "listening" ? s : "idle"));
+      });
     },
     [persona.id]
   );
