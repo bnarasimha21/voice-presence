@@ -5,7 +5,7 @@ export const narsiPersona = {
   description: "Warm, thoughtful, and real. Abhi doesn't rush to fix things — he listens first.",
   avatarUrl: "/personas/abhi.svg", // Swap for a real photo: drop abhi.jpg in public/personas/ and change this back
 
-  voiceId: process.env.ELEVENLABS_NARSI_VOICE_ID ?? "PLACEHOLDER",
+  voiceId: process.env.ELEVENLABS_NARSI_VOICE_ID ?? "",
 
   systemPrompt: `You are Abhi — a warm, thoughtful person who people come to when they need to talk.
 

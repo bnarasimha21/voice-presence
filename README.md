@@ -1,36 +1,38 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# voice-presence
 
-## Getting Started
+A small Next.js app for talking to an AI persona by voice. You speak, it answers aloud.
 
-First, run the development server:
+## What the code does
+
+Each turn is three API routes chained by the browser (`components/VoiceChat.tsx`):
+
+1. `POST /api/stt`: the browser records audio with `MediaRecorder` and sends the blob here. The route forwards it to the Deepgram REST API (`nova-2`) and returns the transcript.
+2. `POST /api/chat`: sends the conversation to Claude (`claude-sonnet-4-6`, `max_tokens` 256) with the persona's system prompt and returns a short reply.
+3. `POST /api/tts`: sends the reply text to the ElevenLabs text-to-speech streaming API (`eleven_turbo_v2_5`) using the persona's voice id and streams MP3 back to be played.
+
+There is one persona, defined in `lib/personas/narsi.ts` (id `narsi`, displayed as "Abhi", a listening-first friend). Adding another means adding a file in `lib/personas/` and registering it in `lib/personas/index.ts`.
+
+## What it does not do
+
+This repo contains no voice-cloning code. It does not create, train, or upload voices. It plays text through a voice that already exists in your ElevenLabs account, identified by an id you supply. If that voice is a clone you made in the ElevenLabs dashboard, the output sounds like it; the cloning itself happens there, not here. Conversation history lives in browser memory only and is not persisted.
+
+## Setup
 
 ```bash
+npm install
+cp .env.local.example .env.local   # or create .env.local by hand
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Environment variables (in `.env.local`):
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `ANTHROPIC_API_KEY` | yes | Claude replies |
+| `DEEPGRAM_API_KEY` | yes | speech to text |
+| `ELEVENLABS_API_KEY` | yes | text to speech |
+| `ELEVENLABS_NARSI_VOICE_ID` | yes | ElevenLabs voice id the persona speaks with. There is no default: `/api/tts` returns a 500 explaining this if it is unset. |
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The microphone needs a secure context, so use `localhost` or HTTPS.

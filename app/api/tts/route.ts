@@ -13,6 +13,13 @@ export async function POST(req: NextRequest) {
     return new Response("Unknown persona", { status: 400 });
   }
 
+  if (!persona.voiceId) {
+    return new Response(
+      "ELEVENLABS_NARSI_VOICE_ID is not set. Add the ElevenLabs voice id to .env.local.",
+      { status: 500 }
+    );
+  }
+
   const stream = await textToSpeechStream(text, persona.voiceId);
 
   return new Response(stream, {
