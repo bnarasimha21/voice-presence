@@ -140,6 +140,12 @@ export function isPersonaUsable(entry: PersonaManifestEntry): boolean {
   const consent = entry.voice.consent;
   if (consent.status !== "granted") return false;
   if (consent.revokedAt) return false;
+  // Issue 15: a status of "granted" with an empty grantedBy/grantedAt is
+  // not a real consent record, just a status flag flipped without the
+  // fields that actually say who agreed to this and when. Requiring both
+  // to be non-empty means flipping `status` alone can never be enough to
+  // let a voice speak.
+  if (!consent.grantedBy.trim() || !consent.grantedAt.trim()) return false;
   return true;
 }
 

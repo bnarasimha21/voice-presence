@@ -61,4 +61,43 @@ describe("isPersonaUsable", () => {
     };
     expect(isPersonaUsable(granted)).toBe(true);
   });
+
+  // Issue 15: a persona must not go live just because someone flipped
+  // `status` to "granted" without actually filling in who granted it and
+  // when.
+  it("is false when status is granted but grantedBy is empty", () => {
+    process.env[base.voice.voiceIdEnv] = "some-voice-id";
+    const missingGrantedBy = {
+      ...base,
+      voice: {
+        ...base.voice,
+        consent: { ...base.voice.consent, status: "granted" as const, revokedAt: undefined, grantedBy: "" },
+      },
+    };
+    expect(isPersonaUsable(missingGrantedBy)).toBe(false);
+  });
+
+  it("is false when status is granted but grantedAt is empty", () => {
+    process.env[base.voice.voiceIdEnv] = "some-voice-id";
+    const missingGrantedAt = {
+      ...base,
+      voice: {
+        ...base.voice,
+        consent: { ...base.voice.consent, status: "granted" as const, revokedAt: undefined, grantedAt: "" },
+      },
+    };
+    expect(isPersonaUsable(missingGrantedAt)).toBe(false);
+  });
+
+  it("is false when grantedBy is whitespace-only", () => {
+    process.env[base.voice.voiceIdEnv] = "some-voice-id";
+    const whitespaceGrantedBy = {
+      ...base,
+      voice: {
+        ...base.voice,
+        consent: { ...base.voice.consent, status: "granted" as const, revokedAt: undefined, grantedBy: "   " },
+      },
+    };
+    expect(isPersonaUsable(whitespaceGrantedBy)).toBe(false);
+  });
 });
