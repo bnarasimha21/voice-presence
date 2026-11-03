@@ -569,6 +569,50 @@ describe("abuse limits (issue 2)", () => {
     }
   });
 
+  it("finding 1: a crisis message still gets a reply once the message-count cap is exceeded", async () => {
+    // Before this fix, validateChatBody's 40-message cap ran BEFORE the
+    // crisis check, so a real conversation past ~20 turns (41 messages)
+    // got a flat 400 on every later request, crisis or not, and zero
+    // safety audio for a genuine crisis message.
+    installFakes({ llm: { reply: "should never be called for a crisis message" } });
+    const history = Array.from({ length: config.maxChatMessages }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: `turn ${i}`,
+    }));
+    const messages = [...history, { role: "user", content: "I want to kill myself" }];
+    expect(messages.length).toBeGreaterThan(config.maxChatMessages);
+
+    const res = await chatHandler(chatRequest({ personaId: "abhi", messages }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.reply).toContain(config.crisisResources);
+  });
+
+  it("finding 1: a crisis message still gets a reply once the total-character cap is exceeded", async () => {
+    installFakes({ llm: { reply: "should never be called for a crisis message" } });
+    const paddingMessage = { role: "user" as const, content: "x".repeat(config.maxChatChars) };
+    const messages = [paddingMessage, { role: "user" as const, content: "I want to kill myself" }];
+    const totalChars = messages.reduce((n, m) => n + m.content.length, 0);
+    expect(totalChars).toBeGreaterThan(config.maxChatChars);
+
+    const res = await chatHandler(chatRequest({ personaId: "abhi", messages }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.reply).toContain(config.crisisResources);
+  });
+
+  it("finding 1: an oversized NON-crisis body is still rejected by the normal 400 path", async () => {
+    // Confirms the loose crisis extraction did not accidentally widen
+    // into a general bypass of the size caps for ordinary conversation.
+    installFakes({ llm: { reply: "ok" } });
+    const history = Array.from({ length: config.maxChatMessages + 1 }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: `turn ${i}`,
+    }));
+    const res = await chatHandler(chatRequest({ personaId: "abhi", messages: history }));
+    expect(res.status).toBe(400);
+  });
+
   it("logs for a full turn contain no transcript or reply text", async () => {
     const fixtureTranscript = "this exact transcript must never be logged";
     const fixtureReply = "this exact reply must never be logged";

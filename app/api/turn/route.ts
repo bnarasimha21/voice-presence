@@ -2,7 +2,13 @@ import { NextRequest } from "next/server";
 import { providers } from "@/lib/providers";
 import { ProviderError } from "@/lib/providers/types";
 import { config, isProduction } from "@/lib/config";
-import { errorResponse, lookupPersona, parseJson, validateChatBody } from "@/lib/validate";
+import {
+  errorResponse,
+  extractLooseChatFields,
+  lookupPersona,
+  parseJson,
+  validateChatBody,
+} from "@/lib/validate";
 import { crisisSafetyReply, crisisTriggeredInMessages } from "@/lib/personas/prompt";
 import {
   checkAndIncrementSessionTurns,
@@ -60,6 +66,117 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     logRequest({ route, status: 400, sessionId });
     return errorResponse(400, "bad_json", "Request body must be valid JSON.");
   }
+  const timing = new TurnTiming();
+  const disclosureTag = id3CommentFrame(
+    "AI-generated voice. Not a recording of a real person speaking live."
+  );
+
+  // Finding 1 (third adversarial review): validateChatBody's message-count
+  // (40) and total-character (8000) caps are a cost/abuse control, not a
+  // safety control, but they used to run BEFORE this crisis check. The
+  // client always sends the full, untrimmed conversation history (see
+  // components/VoiceChat.tsx), so a real conversation past ~20 turns (or
+  // ~8000 total characters) was rejected outright with a flat 400 before
+  // the crisis check ever ran, silencing the safety reply entirely for
+  // exactly the users who have been talking long enough to need it most.
+  //
+  // This loose extraction deliberately does not enforce those caps, so
+  // the crisis check below always gets a chance to run against an
+  // otherwise well-formed body, oversized or not. The normal validation
+  // path (validateChatBody) still runs further down for every non-crisis
+  // request, so the caps are still enforced there; they are just never
+  // allowed to be the reason a crisis message goes unanswered. When it
+  // trips, the fixed safety reply is the entire turn: it is the only text
+  // streamed to the client and the only thing synthesized to audio, so
+  // the spoken output always carries the safety line and it is never at
+  // risk of truncation.
+  const loose = extractLooseChatFields(parsed.value);
+  const loosePersona = loose.personaId ? lookupPersona(loose.personaId) : null;
+  if (loosePersona && loosePersona.usable && crisisTriggeredInMessages(loose.messages)) {
+    const activePersona = loosePersona;
+    const reply = crisisSafetyReply();
+    // Finding 3 (fourth adversarial review): provider construction used
+    // to run before this branch specifically so the crisis short-circuit
+    // would never be blocked by it, but the code still required `tts`
+    // from that same construction, so a provider-config failure (e.g. a
+    // missing env var) made the whole turn 500 before the crisis branch
+    // ever executed, exactly the failure mode the comment above claimed
+    // could not happen. Providers are now constructed lazily, inside
+    // this branch, with a fallback to a text-only safety reply: a crisis
+    // message always gets the safety TEXT even if the provider set is
+    // completely misconfigured, and only loses the spoken audio on top
+    // of that (same degraded behavior as a TTS-only failure just below).
+    let ttsForCrisis: ReturnType<typeof providers>["tts"] | null = null;
+    try {
+      ttsForCrisis = providers().tts;
+    } catch {
+      ttsForCrisis = null;
+    }
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encodeEvent({ type: "text_delta", text: reply }));
+        timing.mark("first_sentence");
+        if (ttsForCrisis) {
+          try {
+            // Deliberately not gated on reserveBudget/isDailyBudgetExceeded:
+            // the crisis safety line must always be attempted regardless of
+            // the day's usage budget. A budget check could otherwise cause
+            // the single most important audio output in this app to be
+            // silently dropped.
+            //
+            // Cost/abuse finding: this text is the exact same constant for
+            // every trigger of a given persona, so it is synthesized once
+            // and cached rather than paying the real TTS provider on every
+            // "kms" message. See lib/crisis-audio-cache.ts.
+            const cached = await getCachedCrisisAudio(ttsForCrisis, {
+              text: reply,
+              voiceId: activePersona.voiceId,
+              model: config.ttsModel,
+              outputFormat: config.ttsOutputFormat,
+            });
+            timing.mark("tts_first_byte");
+            const withTag = concatBytes(disclosureTag, cached.bytes);
+            timing.mark("first_audio_sent");
+            controller.enqueue(
+              encodeEvent({ type: "audio", data: Buffer.from(withTag).toString("base64") })
+            );
+          } catch {
+            // Even if TTS fails, the client still gets the safety text; do
+            // not let a synthesis failure hide the safety reply entirely.
+          }
+        }
+        timing.mark("turn_done");
+        controller.enqueue(encodeEvent({ type: "done", reply, timing: timing.toObject() }));
+        logRequest({ route, status: 200, sessionId, personaId: activePersona.id, crisis: 1 });
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/x-ndjson",
+        "X-AI-Generated-Voice": "true",
+      },
+    });
+  }
+
+  // Issue 9: provider construction can throw (missing/invalid env config
+  // for the selected provider set). Doing this before any stream exists
+  // means a misconfiguration is a handled 500, not an uncaught exception
+  // that only surfaces once the ReadableStream's start() callback runs.
+  // The crisis branch above constructs (and tolerates the absence of)
+  // its own `tts` independently, so this failure can no longer silence
+  // the crisis branch; it only ever blocks the normal, non-crisis flow.
+  let llm: ReturnType<typeof providers>["llm"];
+  let tts: ReturnType<typeof providers>["tts"];
+  try {
+    const p = providers();
+    llm = p.llm;
+    tts = p.tts;
+  } catch {
+    logRequest({ route, status: 500, sessionId });
+    return errorResponse(500, "provider_config_error", "Voice is misconfigured. Please try again later.");
+  }
+
   const validated = validateChatBody(parsed.value);
   if (!validated.ok) {
     logRequest({ route, status: 400, sessionId });
@@ -84,82 +201,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   // `!persona` early-return's narrowing into a callback defined later in
   // the same function.
   const activePersona = persona;
-
-  // Issue 9: provider construction can throw (missing/invalid env config
-  // for the selected provider set). Doing this before any stream exists
-  // means a misconfiguration is a handled 500, not an uncaught exception
-  // that only surfaces once the ReadableStream's start() callback runs.
-  let llm: ReturnType<typeof providers>["llm"];
-  let tts: ReturnType<typeof providers>["tts"];
-  try {
-    const p = providers();
-    llm = p.llm;
-    tts = p.tts;
-  } catch {
-    logRequest({ route, status: 500, sessionId });
-    return errorResponse(500, "provider_config_error", "Voice is misconfigured. Please try again later.");
-  }
-
-  const timing = new TurnTiming();
-  const disclosureTag = id3CommentFrame(
-    "AI-generated voice. Not a recording of a real person speaking live."
-  );
-
-  // Issue 1 / 2 / 3 / finding 6: crisis detection runs on the user's
-  // messages before the model is ever called, and before anything that
-  // is a cost/abuse control rather than a safety control: the rate
-  // limiter, the daily budget, and the per-session turn cap below. None
-  // of those must ever be the reason a crisis safety reply does not go
-  // out. When it trips, the fixed safety reply is the entire turn: it is
-  // the only text streamed to the client and the only thing synthesized
-  // to audio, so the spoken output always carries the safety line and it
-  // is never at risk of truncation.
-  if (crisisTriggeredInMessages(messages)) {
-    const reply = crisisSafetyReply();
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        controller.enqueue(encodeEvent({ type: "text_delta", text: reply }));
-        timing.mark("first_sentence");
-        try {
-          // Deliberately not gated on reserveBudget/isDailyBudgetExceeded:
-          // the crisis safety line must always be attempted regardless of
-          // the day's usage budget. A budget check could otherwise cause
-          // the single most important audio output in this app to be
-          // silently dropped.
-          //
-          // Cost/abuse finding: this text is the exact same constant for
-          // every trigger of a given persona, so it is synthesized once
-          // and cached rather than paying the real TTS provider on every
-          // "kms" message. See lib/crisis-audio-cache.ts.
-          const cached = await getCachedCrisisAudio(tts, {
-            text: reply,
-            voiceId: activePersona.voiceId,
-            model: config.ttsModel,
-            outputFormat: config.ttsOutputFormat,
-          });
-          timing.mark("tts_first_byte");
-          const withTag = concatBytes(disclosureTag, cached.bytes);
-          timing.mark("first_audio_sent");
-          controller.enqueue(
-            encodeEvent({ type: "audio", data: Buffer.from(withTag).toString("base64") })
-          );
-        } catch {
-          // Even if TTS fails, the client still gets the safety text; do
-          // not let a synthesis failure hide the safety reply entirely.
-        }
-        timing.mark("turn_done");
-        controller.enqueue(encodeEvent({ type: "done", reply, timing: timing.toObject() }));
-        logRequest({ route, status: 200, sessionId, personaId: activePersona.id, crisis: 1 });
-        controller.close();
-      },
-    });
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "application/x-ndjson",
-        "X-AI-Generated-Voice": "true",
-      },
-    });
-  }
 
   const rate = checkRateLimit(`turn:${sessionId}`);
   if (!rate.allowed) {

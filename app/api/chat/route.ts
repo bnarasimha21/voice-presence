@@ -4,6 +4,7 @@ import { ProviderError } from "@/lib/providers/types";
 import { config, isProduction } from "@/lib/config";
 import {
   errorResponse,
+  extractLooseChatFields,
   lookupPersona,
   parseJson,
   validateChatBody,
@@ -44,6 +45,30 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     return errorResponse(400, "bad_json", "Request body must be valid JSON.");
   }
 
+  // Finding 1 (third adversarial review): validateChatBody's message-count
+  // (40) and total-character (8000) caps are a cost/abuse control, not a
+  // safety control, but they used to run BEFORE this crisis check. The
+  // client always sends the full, untrimmed conversation history (see
+  // components/VoiceChat.tsx), so a real conversation past ~20 turns (or
+  // ~8000 total characters) was rejected outright with a flat 400 before
+  // the crisis check ever ran, silencing the safety reply entirely for
+  // exactly the users who have been talking long enough to need it most.
+  //
+  // This loose extraction deliberately does not enforce those caps, so
+  // the crisis check below always gets a chance to run against an
+  // otherwise well-formed body, oversized or not. The normal validation
+  // path (validateChatBody) still runs further down for every non-crisis
+  // request, so the caps are still enforced there; they are just never
+  // allowed to be the reason a crisis message goes unanswered.
+  const loose = extractLooseChatFields(parsed.value);
+  const loosePersona = loose.personaId ? lookupPersona(loose.personaId) : null;
+  if (loosePersona && loosePersona.usable && crisisTriggeredInMessages(loose.messages)) {
+    const reply = crisisSafetyReply();
+    const replyToken = issueReplyToken(loosePersona.id, reply, sessionId, true);
+    logRequest({ route, status: 200, sessionId, personaId: loosePersona.id, crisis: 1 });
+    return Response.json({ reply, replyToken });
+  }
+
   const validated = validateChatBody(parsed.value);
   if (!validated.ok) {
     logRequest({ route, status: 400, sessionId });
@@ -63,22 +88,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
       "persona_unavailable",
       "This persona's voice consent is not valid; it cannot be used."
     );
-  }
-
-  // Issue 1 / 2 / 3 / finding 6: crisis detection runs on the user's own
-  // messages, before the model is ever called, and before anything that
-  // is a cost/abuse control rather than a safety control: the rate
-  // limiter, the daily budget, and the per-session turn cap below. None
-  // of those must ever be the reason a crisis safety reply does not go
-  // out. If it trips, the fixed safety reply is the entire turn: it is
-  // never run through the model, never appended to a model reply after
-  // the fact, and never subject to maxSpokenChars truncation (it is
-  // short by construction and is the whole output).
-  if (crisisTriggeredInMessages(messages)) {
-    const reply = crisisSafetyReply();
-    const replyToken = issueReplyToken(persona.id, reply, sessionId, true);
-    logRequest({ route, status: 200, sessionId, personaId: persona.id, crisis: 1 });
-    return Response.json({ reply, replyToken });
   }
 
   const rate = checkRateLimit(`chat:${sessionId}`);
