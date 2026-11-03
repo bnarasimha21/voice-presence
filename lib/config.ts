@@ -37,17 +37,103 @@ export const config = {
   dailyBudgetSttSeconds: int("DAILY_BUDGET_STT_SECONDS", 7200),
   dailyBudgetTtsChars: int("DAILY_BUDGET_TTS_CHARS", 500_000),
 
+  // Issue 5: bounded, self-expiring session turn counts so a session key
+  // (especially a shared "anon:unknown-ip" key) cannot grow the map
+  // forever or stay permanently blocked once it hits the cap.
+  sessionTurnsTtlMs: int("SESSION_TURNS_TTL_MS", 24 * 60 * 60_000), // 24h
+  maxSessionEntries: int("MAX_SESSION_ENTRIES", 50_000),
+
+  // Issue 6: a worst-case seconds reservation for one STT call, used only
+  // to make the daily STT-seconds budget check atomic (reserve before the
+  // call, settle to the real value after). Generous on purpose: a false
+  // reservation that is too low is what causes the race this exists to
+  // close.
+  sttReservationSeconds: int("STT_RESERVATION_SECONDS", 120),
+
   turnSecret: process.env.TURN_SECRET ?? "",
   replyTokenTtlMs: int("REPLY_TOKEN_TTL_MS", 2 * 60_000),
   accessCode: process.env.ACCESS_CODE ?? "",
+  // Issue 8: the access-gate cookie is signed with its own secret, never
+  // with the access code itself (signing with the code would let the
+  // cookie's signature double as a way to confirm/guess the code).
+  // Falls back to TURN_SECRET only so a deploy that already set one
+  // secret does not need two to get the fixed signing scheme; setting a
+  // distinct ACCESS_COOKIE_SECRET is still recommended.
+  accessCookieSecret: process.env.ACCESS_COOKIE_SECRET ?? process.env.TURN_SECRET ?? "",
+  // Issue 5: the session-identity cookie is signed separately so it can
+  // be rotated independently of the other two secrets.
+  sessionCookieSecret: process.env.SESSION_COOKIE_SECRET ?? process.env.TURN_SECRET ?? "",
   voiceEnabled: bool("VOICE_ENABLED", true),
 
-  // Issue 3: disclosure / crisis resources.
+  // Issue 3: disclosure / crisis resources. This app has no way to know
+  // the user's country, so the default is a real, usable, international
+  // default rather than a vague instruction: findahelpline.com (a
+  // directory of crisis lines by country) plus the US 988 Suicide and
+  // Crisis Lifeline as a concrete fallback. A deployer who knows their
+  // audience's country should set CRISIS_RESOURCES to a localized line.
   crisisResources:
     process.env.CRISIS_RESOURCES ??
-    "If you are in immediate danger, please contact your local emergency number.",
+    "If you are in immediate danger, please contact your local emergency number. You can find a crisis line for your country at findahelpline.com. In the US, you can call or text 988 (Suicide and Crisis Lifeline) anytime.",
+
+  // Issue 16: TURN_SECRET ships a placeholder in .env.example; refuse to
+  // boot in production if it was copied verbatim or is too short to be a
+  // real secret.
+  minSecretLength: int("MIN_SECRET_LENGTH", 16),
 };
 
 export function isProduction(): boolean {
   return process.env.NODE_ENV === "production";
+}
+
+// Issue 16: known placeholder values that must never be used verbatim in
+// production. Keep this list in sync with .env.example's placeholders.
+const KNOWN_PLACEHOLDER_SECRETS = new Set([
+  "",
+  "REPLACE_ME",
+  "REPLACE_ME_WITH_A_RANDOM_SECRET",
+  "sk-ant-REPLACE_ME",
+  "test-secret-do-not-use-in-prod",
+]);
+
+export type SecretCheckFailure = { name: string; reason: "placeholder" | "too-short" };
+
+/**
+ * Checks every secret this app signs tokens/cookies with against the
+ * known placeholder list and a minimum length. Returns the list of
+ * failures (empty if everything looks like a real secret); callers decide
+ * what to do with that (the production boot check refuses to start).
+ */
+export function checkSecretsForPlaceholders(): SecretCheckFailure[] {
+  const failures: SecretCheckFailure[] = [];
+  const candidates: [string, string][] = [
+    ["TURN_SECRET", config.turnSecret],
+    ["ACCESS_COOKIE_SECRET", config.accessCookieSecret],
+    ["SESSION_COOKIE_SECRET", config.sessionCookieSecret],
+  ];
+  for (const [name, value] of candidates) {
+    if (KNOWN_PLACEHOLDER_SECRETS.has(value)) {
+      failures.push({ name, reason: "placeholder" });
+    } else if (value.length < config.minSecretLength) {
+      failures.push({ name, reason: "too-short" });
+    }
+  }
+  return failures;
+}
+
+/**
+ * Call once at startup. Throws in production if any secret is a known
+ * placeholder or too short, so a deploy that copied .env.example verbatim
+ * fails to boot instead of silently running with a guessable secret.
+ * A no-op outside production, so local dev and CI are unaffected.
+ */
+export function assertSecretsAreRealInProduction(): void {
+  if (!isProduction()) return;
+  const failures = checkSecretsForPlaceholders();
+  if (failures.length > 0) {
+    const detail = failures.map((f) => `${f.name} (${f.reason})`).join(", ");
+    throw new Error(
+      `Refusing to start in production with an unsafe secret: ${detail}. ` +
+        "Generate real random values (e.g. openssl rand -hex 32) and set them as env vars."
+    );
+  }
 }

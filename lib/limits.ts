@@ -44,16 +44,41 @@ export function resetRateLimits() {
 }
 
 // ---- Per-session turn counting -------------------------------------------
+//
+// Issue 5: bounded and self-expiring. A session key is never kept forever
+// (a TTL sweep forgets it, so a key that hit the cap is not permanently
+// blocked) and the map is capped at config.maxSessionEntries (oldest
+// entries evicted first), so a flood of distinct spoofed keys cannot grow
+// this map without bound.
 
-const sessionTurns = new Map<string, number>();
+type SessionTurnEntry = { count: number; lastSeen: number };
+const sessionTurns = new Map<string, SessionTurnEntry>();
+
+function sweepSessionTurns(now: number) {
+  const ttl = config.sessionTurnsTtlMs;
+  for (const [key, entry] of sessionTurns) {
+    if (now - entry.lastSeen > ttl) sessionTurns.delete(key);
+  }
+  const max = config.maxSessionEntries;
+  if (sessionTurns.size > max) {
+    const oldestFirst = [...sessionTurns.entries()].sort(
+      (a, b) => a[1].lastSeen - b[1].lastSeen
+    );
+    const excess = sessionTurns.size - max;
+    for (let i = 0; i < excess; i++) sessionTurns.delete(oldestFirst[i][0]);
+  }
+}
 
 export function checkAndIncrementSessionTurns(
   sessionId: string,
-  max: number = config.maxTurnsPerSession
+  max: number = config.maxTurnsPerSession,
+  now: number = Date.now()
 ): boolean {
-  const count = sessionTurns.get(sessionId) ?? 0;
+  sweepSessionTurns(now);
+  const entry = sessionTurns.get(sessionId);
+  const count = entry?.count ?? 0;
   if (count >= max) return false;
-  sessionTurns.set(sessionId, count + 1);
+  sessionTurns.set(sessionId, { count: count + 1, lastSeen: now });
   return true;
 }
 
@@ -61,7 +86,14 @@ export function resetSessionTurns() {
   sessionTurns.clear();
 }
 
+/** Test-only: how many live entries the session-turns map currently holds. */
+export function sessionTurnsSize(): number {
+  return sessionTurns.size;
+}
+
 // ---- Daily usage budget (UTC day), counted in provider units -----------
+
+type BudgetKind = "llmTokens" | "sttSeconds" | "ttsChars";
 
 type DailyUsage = {
   day: string; // YYYY-MM-DD, UTC
@@ -81,6 +113,43 @@ function rollIfNewDay() {
   if (usage.day !== today) {
     usage = { day: today, llmTokens: 0, sttSeconds: 0, ttsChars: 0 };
   }
+}
+
+function budgetFor(kind: BudgetKind): number {
+  if (kind === "llmTokens") return config.dailyBudgetLlmTokens;
+  if (kind === "sttSeconds") return config.dailyBudgetSttSeconds;
+  return config.dailyBudgetTtsChars;
+}
+
+// Issue 6: the budget check and the budget increment used to happen in
+// two separate steps with a provider call (and therefore an await) in
+// between, so N concurrent requests could all pass the check before any
+// of them recorded usage, overshooting the budget by up to N times the
+// per-request amount. `reserveBudget` is a single synchronous
+// function: it reads and writes `usage` with no `await` anywhere inside
+// it, so under Node's single-threaded event loop no other request's code
+// can run between the read and the write. That makes "check, then
+// reserve" atomic without needing a lock. Callers reserve a worst-case
+// estimate *before* the provider call, then call `settleBudget` to
+// correct the reservation down (or up) to the real value once it is
+// known, or `releaseBudget` to fully roll the reservation back if the
+// call failed.
+
+export function reserveBudget(kind: BudgetKind, amount: number): boolean {
+  rollIfNewDay();
+  if (usage[kind] + amount > budgetFor(kind)) return false;
+  usage[kind] += amount;
+  return true;
+}
+
+export function settleBudget(kind: BudgetKind, reserved: number, actual: number) {
+  rollIfNewDay();
+  usage[kind] += actual - reserved;
+  if (usage[kind] < 0) usage[kind] = 0;
+}
+
+export function releaseBudget(kind: BudgetKind, reserved: number) {
+  settleBudget(kind, reserved, 0);
 }
 
 export function recordLlmUsage(tokens: number) {
