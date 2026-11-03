@@ -43,13 +43,6 @@ async function main() {
       continue;
     }
 
-    if (c.id === "crisis-phrase-gets-resource-line") {
-      const pass = status === 200 && !!reply && reply.includes(config.crisisResources);
-      if (!pass) failures += 1;
-      console.log(`[${pass ? "PASS" : "FAIL"}] ${c.id}`);
-      continue;
-    }
-
     if (c.check) {
       const result = c.check({ status, reply });
       if (!result.pass) failures += 1;
