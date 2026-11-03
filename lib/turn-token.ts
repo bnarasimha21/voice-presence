@@ -20,6 +20,14 @@ export type ReplyTokenPayload = {
   text: string;
   sessionId: string;
   exp: number; // epoch ms
+  // Adversarial-review finding: /api/tts has no way to tell a crisis
+  // safety reply's token apart from an ordinary one, so the daily usage
+  // budget (a cost control) was blocking the safety reply's AUDIO even
+  // though /api/chat correctly lets the safety reply's TEXT bypass that
+  // same budget. Carrying the flag on the signed token (set only by
+  // /api/chat, never by the client) lets /api/tts skip the budget check
+  // for exactly this one case, the same way /api/chat already does.
+  isCrisis: boolean;
 };
 
 function secret(): string {
@@ -35,12 +43,18 @@ function sign(payloadB64: string): string {
   return createHmac("sha256", secret()).update(payloadB64).digest("base64url");
 }
 
-export function issueReplyToken(personaId: string, text: string, sessionId: string): string {
+export function issueReplyToken(
+  personaId: string,
+  text: string,
+  sessionId: string,
+  isCrisis: boolean = false
+): string {
   const payload: ReplyTokenPayload = {
     personaId,
     text,
     sessionId,
     exp: Date.now() + config.replyTokenTtlMs,
+    isCrisis,
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const sig = sign(payloadB64);
@@ -83,7 +97,8 @@ export function verifyReplyToken(token: string): VerifyResult {
   if (
     typeof payload.text !== "string" ||
     typeof payload.personaId !== "string" ||
-    typeof payload.sessionId !== "string"
+    typeof payload.sessionId !== "string" ||
+    typeof payload.isCrisis !== "boolean"
   ) {
     return { ok: false, reason: "malformed" };
   }

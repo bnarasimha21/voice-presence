@@ -81,7 +81,7 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   // truncation (it is short by construction and is the whole output).
   if (crisisTriggeredInMessages(messages)) {
     const reply = crisisSafetyReply();
-    const replyToken = issueReplyToken(persona.id, reply, sessionId);
+    const replyToken = issueReplyToken(persona.id, reply, sessionId, true);
     logRequest({ route, status: 200, sessionId, personaId: persona.id, crisis: 1 });
     return Response.json({ reply, replyToken });
   }

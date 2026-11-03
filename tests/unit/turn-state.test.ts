@@ -81,14 +81,44 @@ describe("turn state reducer (issue 5/12)", () => {
   // Issue 12, regression 3: VOICE_DETECTED while "thinking" (the user
   // starts talking again before the first audio chunk is even ready) used
   // to be a silent no-op, so the stale reply still played once it arrived.
-  it("VOICE_DETECTED while thinking interrupts, same as while speaking", () => {
+  it("VOICE_DETECTED while thinking interrupts and clears the superseded turnId", () => {
+    // Adversarial-review finding: the old turn's id must not survive the
+    // interruption, or a late reply event for it can still match after
+    // VOICE_ENDED puts the machine back in "thinking" for the next
+    // utterance (see the regression test below for the full sequence).
     const m = reduceTurnState(at("thinking", 1), { type: "VOICE_DETECTED" });
-    expect(m).toEqual({ state: "interrupted", turnId: 1 });
+    expect(m).toEqual({ state: "interrupted", turnId: null });
   });
 
-  it("VOICE_DETECTED while speaking interrupts", () => {
+  it("VOICE_DETECTED while speaking interrupts and clears the superseded turnId", () => {
     const m = reduceTurnState(at("speaking", 1), { type: "VOICE_DETECTED" });
-    expect(m).toEqual({ state: "interrupted", turnId: 1 });
+    expect(m).toEqual({ state: "interrupted", turnId: null });
+  });
+
+  // Adversarial-review finding, regression 7: a late REPLY_FINISHED for
+  // the turn that was just barged into must not collapse the machine to
+  // idle while the next utterance is still being recorded/submitted.
+  // Before the turnId-clearing fix above, VOICE_ENDED reused the old
+  // turn's id (nothing mints a new one until SUBMITTED resolves), so the
+  // stale REPLY_FINISHED still matched and forced the machine to idle;
+  // once the real SUBMITTED for the second utterance arrived, "idle" was
+  // not a valid source state for SUBMITTED, so the second turn's events
+  // were never tracked at all.
+  it("a late REPLY_FINISHED for a turn barged into mid-thinking does not collapse the next turn to idle", () => {
+    let m = at("thinking", 1);
+    m = reduceTurnState(m, { type: "VOICE_DETECTED" }); // barge-in: turn 1 interrupted
+    expect(m).toEqual({ state: "interrupted", turnId: null });
+    m = reduceTurnState(m, { type: "VOICE_ENDED" }); // listening ends, waiting to submit turn 2
+    expect(m).toEqual({ state: "thinking", turnId: null });
+
+    // Turn 1's REPLY_FINISHED arrives late, before turn 2 has been
+    // SUBMITTED yet. It must not match (turnId is null, event.turnId is 1).
+    const afterLateFinish = reduceTurnState(m, { type: "REPLY_FINISHED", turnId: 1 });
+    expect(afterLateFinish).toEqual({ state: "thinking", turnId: null });
+
+    // The real SUBMITTED for turn 2 must still be accepted from this state.
+    const afterSubmit = reduceTurnState(afterLateFinish, { type: "SUBMITTED", turnId: 2 });
+    expect(afterSubmit).toEqual({ state: "thinking", turnId: 2 });
   });
 
   // Issue 12, regression 4: a reply with no audio at all (empty LLM

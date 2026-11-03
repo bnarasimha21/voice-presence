@@ -38,7 +38,11 @@ const CRISIS_PATTERNS: RegExp[] = [
   /\bend\s*it\s*all\b/,
   /\bunalive(?:\s*my\s*self)?\b/,
   /\bcommit(?:t?ing)?\s+suicide\b/,
-  /\bsuicidal?\b/,
+  // Issue 1 regression: "suicidal?" only matches "suicidal", never the
+  // plain noun "suicide" (which ends in "e", not "a"/"al"). Matching the
+  // stem directly catches both "suicide" and "suicidal" regardless of
+  // what verb, if any, precedes it.
+  /\bsuicid(?:e|al)\b/,
   /\bwant(?:ed|s|ing)?\s+to\s+die\b/,
   /\b(?:ready|want(?:ed|s|ing)?)\s+to\s+(?:end\s+my\s+life|die)\b/,
   /\bbetter\s+off\s+dead\b/,

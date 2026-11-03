@@ -72,7 +72,16 @@ export function reduceTurnState(current: TurnMachineState, event: TurnEvent): Tu
     // which also makes the separate BARGE_IN event redundant: VOICE_DETECTED
     // is the real signal the browser's VAD emits either way.
     if (state === "thinking" || state === "speaking") {
-      return { state: "interrupted", turnId };
+      // Adversarial-review finding: the superseded turn's id must be
+      // invalidated here, not just the state label. Without this, a late
+      // REPLY_STARTED/REPLY_FINISHED for the turn that just got barged
+      // into still matches `turnId` after VOICE_ENDED moves the machine
+      // back to "thinking" (reusing the same old id, since the new
+      // utterance has not been SUBMITTED yet) and wrongly collapses the
+      // machine to idle while the next turn is still being recorded. With
+      // turnId cleared, that late event's id can never match null and is
+      // correctly ignored instead.
+      return { state: "interrupted", turnId: null };
     }
     return current;
   }

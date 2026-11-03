@@ -35,11 +35,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
   }
 
-  if (isDailyBudgetExceeded()) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
-  }
-
   const parsed = await parseJson(req);
   if (!parsed.ok) {
     logRequest({ route, status: 400, sessionId });
@@ -76,6 +71,18 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     return errorResponse(400, "invalid_token", "Reply token has already been used.");
   }
 
+  // Adversarial-review finding: the daily budget is a cost control, not a
+  // safety control. /api/chat already lets a crisis safety reply's TEXT
+  // bypass the budget entirely; without this check, a crisis reply's
+  // AUDIO could still be silently dropped here whenever the shared daily
+  // budget happened to already be exhausted, which is normal operation,
+  // not an attack. The isCrisis flag is set only by /api/chat, inside the
+  // signed token, so a client cannot forge it to get free synthesis.
+  if (!verified.payload.isCrisis && isDailyBudgetExceeded()) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
+  }
+
   const persona = lookupPersona(verified.payload.personaId);
   if (!persona) {
     logRequest({ route, status: 400, sessionId });
@@ -95,8 +102,11 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   // Issue 6: the ttsChars amount is known exactly up front (the text's
   // own length), so this reserves it atomically before the provider call
   // and releases it if the call fails, closing the same check-then-record
-  // race the LLM token budget had.
-  if (!reserveBudget("ttsChars", text.length)) {
+  // race the LLM token budget had. Skipped for a crisis reply, same as
+  // the budget-exceeded check above: the safety reply's audio is never
+  // gated on or counted against the shared daily budget.
+  const isCrisis = verified.payload.isCrisis;
+  if (!isCrisis && !reserveBudget("ttsChars", text.length)) {
     logRequest({ route, status: 429, sessionId });
     return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
   }
@@ -112,7 +122,7 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
         signal: req.signal,
       });
     } catch (err) {
-      releaseBudget("ttsChars", text.length);
+      if (!isCrisis) releaseBudget("ttsChars", text.length);
       throw err;
     }
 

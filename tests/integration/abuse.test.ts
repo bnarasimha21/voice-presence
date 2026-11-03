@@ -142,7 +142,10 @@ describe("abuse limits (issue 2)", () => {
       expect(chatRes.status).toBe(429);
 
       const ttsRes = await ttsHandler(
-        ttsRequest({ replyToken: issueReplyToken("abhi", "x", "session-x") })
+        ttsRequest(
+          { replyToken: issueReplyToken("abhi", "x", "session-x") },
+          sessionCookieHeader("session-x")
+        )
       );
       expect(ttsRes.status).toBe(429);
 
@@ -179,6 +182,63 @@ describe("abuse limits (issue 2)", () => {
       expect(body.reply).toContain(config.crisisResources);
     } finally {
       config.dailyBudgetLlmTokens = originalBudget;
+    }
+  });
+
+  it("a crisis reply's AUDIO still plays through /api/tts once the daily budget is exceeded", async () => {
+    // Adversarial-review finding: /api/chat already let a crisis reply's
+    // TEXT bypass the budget, but /api/tts still gated the reply's AUDIO
+    // on the same exhausted budget, because it had no way to tell a
+    // crisis token apart from an ordinary one. This exercises the full
+    // chat -> tts flow a real user would hit: ask for help while the
+    // shared daily budget is already exhausted (normal operation, not an
+    // attack), and confirm the safety reply is actually heard, not just
+    // returned as text that the UI then fails to speak.
+    const fakes = installFakes({ llm: { reply: "ok" } });
+    const originalBudget = config.dailyBudgetLlmTokens;
+    const originalTtsBudget = config.dailyBudgetTtsChars;
+    config.dailyBudgetLlmTokens = 0;
+    config.dailyBudgetTtsChars = 0;
+    try {
+      const { recordLlmUsage, recordTtsUsage } = await import("@/lib/limits");
+      recordLlmUsage(1);
+      recordTtsUsage(1);
+      const cookie = sessionCookieHeader("session-crisis-audio");
+
+      const chatRes = await chatHandler(
+        chatRequest(
+          { personaId: "abhi", messages: [{ role: "user", content: "I want to kill myself" }] },
+          cookie
+        )
+      );
+      expect(chatRes.status).toBe(200);
+      const { reply, replyToken } = await chatRes.json();
+      expect(reply).toContain(config.crisisResources);
+
+      const ttsRes = await ttsHandler(ttsRequest({ replyToken }, cookie));
+      expect(ttsRes.status).toBe(200);
+      expect(fakes.tts.calls.length).toBe(1);
+    } finally {
+      config.dailyBudgetLlmTokens = originalBudget;
+      config.dailyBudgetTtsChars = originalTtsBudget;
+    }
+  });
+
+  it("an ordinary (non-crisis) reply's audio is still blocked once the daily TTS budget is exceeded", async () => {
+    // Confirms the crisis bypass above did not accidentally widen into a
+    // general bypass: a non-crisis token must still be rejected.
+    const fakes = installFakes({ llm: { reply: "ok" } });
+    const originalTtsBudget = config.dailyBudgetTtsChars;
+    config.dailyBudgetTtsChars = 0;
+    try {
+      const { recordTtsUsage } = await import("@/lib/limits");
+      recordTtsUsage(1);
+      const token = issueReplyToken("abhi", "just an ordinary reply", "session-x");
+      const res = await ttsHandler(ttsRequest({ replyToken: token }, sessionCookieHeader("session-x")));
+      expect(res.status).toBe(429);
+      expect(fakes.tts.calls.length).toBe(0);
+    } finally {
+      config.dailyBudgetTtsChars = originalTtsBudget;
     }
   });
 
