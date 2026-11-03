@@ -1,0 +1,180 @@
+// Issue 2: /api/chat returns a signed token bound to the exact reply text
+// it generated; /api/tts will only speak a text it can verify came from
+// that token. This stops the cloned voice from being an open
+// text-to-speech endpoint for arbitrary text. It does not stop a user from
+// trying to talk the model into saying a particular sentence: that is a
+// prompt-injection problem the other controls (limits, persona prompt
+// rules) address, and the README says so plainly.
+//
+// Issue 11: the token is also bound to the session that minted it (so one
+// session's token cannot be redeemed under another session's identity)
+// and is single-use (redeeming it twice, even inside its TTL, is
+// rejected), so a captured token cannot be replayed to re-bill TTS
+// synthesis indefinitely.
+
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
+import { config } from "@/lib/config";
+
+export type ReplyTokenPayload = {
+  personaId: string;
+  text: string;
+  sessionId: string;
+  exp: number; // epoch ms
+  // Adversarial-review finding: /api/tts has no way to tell a crisis
+  // safety reply's token apart from an ordinary one, so the daily usage
+  // budget (a cost control) was blocking the safety reply's AUDIO even
+  // though /api/chat correctly lets the safety reply's TEXT bypass that
+  // same budget. Carrying the flag on the signed token (set only by
+  // /api/chat, never by the client) lets /api/tts skip the budget check
+  // for exactly this one case, the same way /api/chat already does.
+  isCrisis: boolean;
+  // Finding 4 (third adversarial review): without a nonce, identical
+  // personaId+text+sessionId inputs minted within the same millisecond
+  // (exp is derived from Date.now(), so two tokens issued in the same ms
+  // are byte-for-byte identical) produced the exact same token string.
+  // markTokenRedeemed then rejected the second as a replay of the first,
+  // so concurrent legitimate requests on the same session (most acutely:
+  // several concurrent crisis triggers on one session, or one shared-IP
+  // session after the earlier session-identity fix) could lose all but
+  // one of them to a false "already used" rejection. A random nonce
+  // makes every issued token unique regardless of how many are minted in
+  // the same millisecond for the same persona/text/session.
+  //
+  // Finding 6 (fourth adversarial review): making this field required in
+  // verifyReplyToken's malformed-check would reject any token minted by
+  // the previous version of this code (no nonce field at all) as
+  // malformed, for as long as that token's TTL (replyTokenTtlMs, default
+  // 2 minutes). During a deploy, a crisis reply token issued by an
+  // old-code instance just before cutover could then fail to redeem for
+  // audio against a new-code instance right after, silencing the safety
+  // reply's audio for an unlucky few minutes. The field stays required
+  // on *new* tokens (issueReplyToken always sets it) but verification
+  // below treats a missing nonce as "" rather than malformed, so an
+  // old-format token already in flight still verifies; it just never
+  // collides with anything because it is the only token like it.
+  nonce?: string;
+};
+
+function secret(): string {
+  if (!config.turnSecret) {
+    throw new Error(
+      "TURN_SECRET is not set. Set it in .env.local so /api/chat can sign reply tokens."
+    );
+  }
+  return config.turnSecret;
+}
+
+function sign(payloadB64: string): string {
+  return createHmac("sha256", secret()).update(payloadB64).digest("base64url");
+}
+
+export function issueReplyToken(
+  personaId: string,
+  text: string,
+  sessionId: string,
+  isCrisis: boolean = false
+): string {
+  const payload: ReplyTokenPayload = {
+    personaId,
+    text,
+    sessionId,
+    exp: Date.now() + config.replyTokenTtlMs,
+    isCrisis,
+    nonce: randomBytes(9).toString("base64url"),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = sign(payloadB64);
+  return `${payloadB64}.${sig}`;
+}
+
+export type VerifyResult =
+  | { ok: true; payload: ReplyTokenPayload }
+  | { ok: false; reason: "malformed" | "bad-signature" | "expired" };
+
+/** Pure verification: checks signature, shape and expiry. No side effects. */
+export function verifyReplyToken(token: string): VerifyResult {
+  const parts = token.split(".");
+  if (parts.length !== 2) return { ok: false, reason: "malformed" };
+  const [payloadB64, sig] = parts;
+
+  let expectedSig: string;
+  try {
+    expectedSig = sign(payloadB64);
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return { ok: false, reason: "bad-signature" };
+  }
+
+  let payload: ReplyTokenPayload;
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+
+  if (typeof payload.exp !== "number" || Date.now() > payload.exp) {
+    return { ok: false, reason: "expired" };
+  }
+  if (
+    typeof payload.text !== "string" ||
+    typeof payload.personaId !== "string" ||
+    typeof payload.sessionId !== "string" ||
+    typeof payload.isCrisis !== "boolean" ||
+    (payload.nonce !== undefined && typeof payload.nonce !== "string")
+  ) {
+    return { ok: false, reason: "malformed" };
+  }
+
+  return { ok: true, payload: { ...payload, nonce: payload.nonce ?? "" } };
+}
+
+// ---- Single-use redemption ------------------------------------------------
+//
+// Bounded, self-expiring: entries are swept by their own token expiry, so
+// this can never grow past "tokens issued within one TTL window."
+
+const redeemedTokens = new Map<string, number>(); // token -> its own exp
+
+function sweepRedeemedTokens(now: number) {
+  for (const [token, exp] of redeemedTokens) {
+    if (now > exp) redeemedTokens.delete(token);
+  }
+}
+
+/**
+ * Marks a token as redeemed. Returns false (and leaves state unchanged)
+ * if this exact token was already redeemed, so a replay of a captured
+ * token is rejected rather than re-billing synthesis.
+ */
+export function markTokenRedeemed(token: string, exp: number, now: number = Date.now()): boolean {
+  sweepRedeemedTokens(now);
+  if (redeemedTokens.has(token)) return false;
+  redeemedTokens.set(token, exp);
+  return true;
+}
+
+/**
+ * Finding 7 (adversarial review): /api/tts used to mark a token redeemed
+ * before attempting synthesis, so a single ElevenLabs failure (a timeout,
+ * a 5xx, anything transient) permanently burned the token: the caller's
+ * only recourse was asking /api/chat for a whole new reply, including a
+ * crisis safety reply, the one output this app can least afford to lose
+ * to a provider hiccup. Callers should reserve the token with
+ * markTokenRedeemed() before the provider call (keeping the
+ * anti-replay/anti-concurrent-redemption property), then call this to
+ * release it back to "not yet redeemed" if that call fails, so the exact
+ * same token can be retried. A call that succeeds must never call this:
+ * the token stays redeemed, which is what keeps it single-use.
+ */
+export function releaseRedeemedToken(token: string): void {
+  redeemedTokens.delete(token);
+}
+
+export function resetRedeemedTokens() {
+  redeemedTokens.clear();
+}

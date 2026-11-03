@@ -13,8 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Abhi — a friend who listens",
-  description: "A warm, thoughtful voice companion who listens first.",
+  title: "Abhi, an AI voice companion",
+  description:
+    "A warm, thoughtful AI voice companion who listens first. Synthetic voice, used with the voice owner's consent.",
 };
 
 export default function RootLayout({

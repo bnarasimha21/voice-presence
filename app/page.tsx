@@ -1,15 +1,18 @@
 import Link from "next/link";
-import { personas } from "@/lib/personas";
+import { personas, usablePersonas } from "@/lib/personas";
 
 export default function Home() {
-  const personaList = Object.values(personas);
+  const personaList = usablePersonas();
+  const unusable = Object.values(personas).filter((p) => !p.usable);
 
   return (
     <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center justify-center gap-12 p-8">
       <div className="text-center space-y-3">
         <h1 className="text-4xl font-bold tracking-tight">Someone to talk to</h1>
         <p className="text-neutral-400 max-w-sm">
-          Real conversations with real people — powered by AI, in their actual voice.
+          Talk with an AI voice persona. The voice is synthetic: it is not a live
+          recording of a real person, and only runs with that person&apos;s recorded
+          consent.
         </p>
       </div>
 
@@ -35,14 +38,20 @@ export default function Home() {
           </Link>
         ))}
 
-        {/* V2 placeholder — Abhi */}
-        <div className="flex items-center gap-4 bg-neutral-900/40 rounded-2xl p-4 opacity-40 cursor-not-allowed select-none">
-          <div className="w-14 h-14 rounded-full bg-neutral-800 flex-shrink-0" />
-          <div>
-            <p className="font-semibold">Abhi</p>
-            <p className="text-sm text-neutral-500">Coming soon</p>
+        {unusable.map((persona) => (
+          <div
+            key={persona.id}
+            className="flex items-center gap-4 bg-neutral-900/40 rounded-2xl p-4 opacity-40 cursor-not-allowed select-none"
+          >
+            <div className="w-14 h-14 rounded-full bg-neutral-800 flex-shrink-0" />
+            <div>
+              <p className="font-semibold">{persona.name}</p>
+              <p className="text-sm text-neutral-500">
+                Unavailable: voice consent is missing or revoked.
+              </p>
+            </div>
           </div>
-        </div>
+        ))}
       </div>
     </main>
   );

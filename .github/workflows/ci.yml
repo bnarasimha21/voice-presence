@@ -1,0 +1,50 @@
+name: CI
+
+# Everything here runs against the fake providers only: VOICE_PROVIDERS=fake
+# and no real vendor keys are set anywhere in this file. No job makes a
+# network call to Anthropic, Deepgram, or ElevenLabs.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NODE_ENV: test
+  VOICE_PROVIDERS: fake
+  TURN_SECRET: ci-test-secret-do-not-use-in-prod
+  ELEVENLABS_NARSI_VOICE_ID: ci-fake-voice-id
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Voice eval (latency and cost report, fake providers)
+        run: npm run eval
+
+      - name: Persona eval (deterministic cases only, fake providers)
+        run: npm run eval:persona
+
+      - name: Build
+        run: npm run build

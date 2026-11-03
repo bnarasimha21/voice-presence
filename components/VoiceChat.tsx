@@ -2,15 +2,29 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import type { Persona } from "@/lib/personas";
-import type { Message } from "@/lib/claude";
 
 type Status = "idle" | "listening" | "thinking" | "speaking";
 
+export type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+async function readApiError(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    if (body?.error?.message) return String(body.error.message);
+  } catch {
+    // not JSON; fall through
+  }
+  return res.statusText || `request failed (${res.status})`;
+}
+
 export function VoiceChat({ persona }: { persona: Persona }) {
   const [status, setStatus] = useState<Status>("idle");
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [lastReply, setLastReply] = useState("");
-  const [ttsError, setTtsError] = useState("");
+  const [errorText, setErrorText] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -28,7 +42,6 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, lastReply]);
 
-  // Drive --level (0..1) on the orb from the mic's volume while listening.
   const startLevelMeter = useCallback((stream: MediaStream) => {
     try {
       const Ctx =
@@ -47,7 +60,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         analyser.getByteFrequencyData(data);
         let sum = 0;
         for (let i = 0; i < data.length; i++) sum += data[i];
-        const avg = sum / data.length / 255; // 0..1
+        const avg = sum / data.length / 255;
         orbRef.current?.style.setProperty(
           "--level",
           String(Math.min(1, avg * 1.9))
@@ -75,34 +88,39 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     }
   }, []);
 
-  const speak = useCallback(
-    async (text: string) => {
-      setStatus("speaking");
-      setLastReply(text);
-      setTtsError("");
+  // Always resolves. Every failure path sets an error caption and returns
+  // the UI to "idle" (unless the user has already started listening
+  // again), so the orb is never stuck disabled by a failed request.
+  const speak = useCallback(async (text: string, replyToken: string) => {
+    setStatus("speaking");
+    setLastReply(text);
+    setErrorText("");
 
-      let res: Response;
-      try {
-        res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, personaId: persona.id }),
-        });
-      } catch (err) {
-        setTtsError(`Voice failed: ${err instanceof Error ? err.message : "network error"}`);
-        // Do not clobber a recording the user started while the request was in flight
-        setStatus((s) => (s === "listening" ? s : "idle"));
-        return;
-      }
+    const toIdleUnlessListening = () =>
+      setStatus((s) => (s === "listening" ? s : "idle"));
 
-      if (!res.ok) {
-        // Surface the server's explanation (e.g. a missing voice id) instead of failing silently
-        const detail = (await res.text().catch(() => "")).trim().slice(0, 200);
-        setTtsError(`Voice failed (${res.status}): ${detail || res.statusText || "unknown error"}`);
-        setStatus((s) => (s === "listening" ? s : "idle"));
-        return;
-      }
+    let res: Response;
+    try {
+      res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ replyToken }),
+      });
+    } catch (err) {
+      setErrorText(
+        `Voice failed: ${err instanceof Error ? err.message : "network error"}`
+      );
+      toIdleUnlessListening();
+      return;
+    }
 
+    if (!res.ok) {
+      setErrorText(`Voice failed: ${await readApiError(res)}`);
+      toIdleUnlessListening();
+      return;
+    }
+
+    try {
       const audioBlob = await res.blob();
       const url = URL.createObjectURL(audioBlob);
 
@@ -112,45 +130,84 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         setStatus("idle");
         URL.revokeObjectURL(url);
       };
-      audioRef.current.play().catch(() => {
-        setTtsError("Audio could not play");
-        setStatus((s) => (s === "listening" ? s : "idle"));
-      });
-    },
-    [persona.id]
-  );
+      await audioRef.current.play();
+    } catch {
+      setErrorText("Audio could not play.");
+      toIdleUnlessListening();
+    }
+  }, []);
 
   const sendMessage = useCallback(
     async (userText: string) => {
       if (!userText.trim()) return;
 
-      const newMessages: Message[] = [
+      const newMessages: ChatMessage[] = [
         ...messages,
         { role: "user", content: userText },
       ];
       setMessages(newMessages);
-      setTtsError("");
+      setErrorText("");
       setStatus("thinking");
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ personaId: persona.id, messages: newMessages }),
-      });
+      let res: Response;
+      try {
+        res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ personaId: persona.id, messages: newMessages }),
+        });
+      } catch (err) {
+        setErrorText(
+          `Could not reach the assistant: ${err instanceof Error ? err.message : "network error"}`
+        );
+        setStatus("idle");
+        return;
+      }
 
-      const { reply } = await res.json();
+      if (!res.ok) {
+        setErrorText(`The assistant failed: ${await readApiError(res)}`);
+        setStatus("idle");
+        return;
+      }
+
+      let reply: string;
+      let replyToken: string;
+      try {
+        const body = await res.json();
+        reply = body.reply;
+        replyToken = body.replyToken;
+        if (typeof reply !== "string" || typeof replyToken !== "string") {
+          throw new Error("malformed response");
+        }
+      } catch {
+        setErrorText("The assistant returned an unexpected response.");
+        setStatus("idle");
+        return;
+      }
+
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
-      await speak(reply);
+      await speak(reply, replyToken);
     },
     [messages, persona.id, speak]
   );
 
   const startListening = useCallback(async () => {
-    stopSpeaking(); // barge-in: cut off Abhi if he's mid-sentence
-    setStatus("listening");
+    stopSpeaking(); // barge-in: cut off the persona if mid-sentence
+    setErrorText("");
     chunksRef.current = [];
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setErrorText(
+        "Microphone access was denied. Allow microphone access and try again."
+      );
+      setStatus("idle");
+      return;
+    }
+
+    setStatus("listening");
     startLevelMeter(stream);
 
     const recorder = new MediaRecorder(stream);
@@ -162,13 +219,34 @@ export function VoiceChat({ persona }: { persona: Persona }) {
       stopLevelMeter();
 
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-      const res = await fetch("/api/stt", { method: "POST", body: blob });
-      if (!res.ok) {
+      let res: Response;
+      try {
+        res = await fetch("/api/stt", { method: "POST", body: blob });
+      } catch (err) {
+        setErrorText(
+          `Could not transcribe: ${err instanceof Error ? err.message : "network error"}`
+        );
         setStatus("idle");
         return;
       }
-      const { transcript } = await res.json();
-      if (!transcript?.trim()) {
+
+      if (!res.ok) {
+        setErrorText(`Could not transcribe: ${await readApiError(res)}`);
+        setStatus("idle");
+        return;
+      }
+
+      let transcript: string;
+      try {
+        const body = await res.json();
+        transcript = body.transcript ?? "";
+      } catch {
+        setErrorText("Transcription returned an unexpected response.");
+        setStatus("idle");
+        return;
+      }
+
+      if (!transcript.trim()) {
         setStatus("idle");
         return;
       }
@@ -183,7 +261,6 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     mediaRecorderRef.current = null;
   }, []);
 
-  // Toggle: start if idle/speaking, stop & send if already listening.
   const toggleMic = useCallback(() => {
     if (status === "listening") {
       stopListening();
@@ -192,7 +269,6 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     }
   }, [status, startListening, stopListening]);
 
-  // Spacebar: press once to start, press again to send.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code !== "Space" || e.repeat) return;
@@ -210,13 +286,11 @@ export function VoiceChat({ persona }: { persona: Persona }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleMic]);
 
-  // Tear down audio plumbing on unmount.
   useEffect(() => stopLevelMeter, [stopLevelMeter]);
 
-  // The line shown softly beneath the orb, by state.
   const caption =
-    ttsError && status === "idle"
-      ? ttsError
+    errorText && status === "idle"
+      ? errorText
       : status === "listening"
       ? "Listening…"
       : status === "thinking"
@@ -224,7 +298,7 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         : status === "speaking"
           ? lastReply
           : messages.length === 0
-            ? "So—what's on your mind?"
+            ? `This is an AI voice speaking as ${persona.name}, not a live recording. So, what's on your mind?`
             : "Tap the orb or press space";
 
   const hint =
@@ -236,13 +310,16 @@ export function VoiceChat({ persona }: { persona: Persona }) {
 
   return (
     <div className="orb-stage flex flex-col h-screen text-white overflow-hidden">
-      {/* Persona header */}
-      <header className="flex flex-col items-center gap-1 pt-10 shrink-0">
+      {/* Issue 3: layered disclosure, visible label while the persona is on screen */}
+      <div className="w-full text-center bg-amber-900/40 text-amber-200 text-xs py-1 tracking-wide">
+        AI voice, not a recording of a real person speaking live
+      </div>
+
+      <header className="flex flex-col items-center gap-1 pt-6 shrink-0">
         <h1 className="text-lg font-medium tracking-wide">{persona.name}</h1>
         <p className="text-neutral-500 text-xs">{persona.tagline}</p>
       </header>
 
-      {/* Orb — the centerpiece and the control */}
       <main className="flex-1 flex flex-col items-center justify-center gap-10 px-6">
         <button
           ref={orbRef}
@@ -261,34 +338,33 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         <p
           key={caption}
           className={`caption-in max-w-md text-center text-base min-h-7 px-4 ${
-            ttsError && status === "idle" ? "text-red-400" : "text-neutral-200"
+            errorText && status === "idle" ? "text-red-400" : "text-neutral-200"
           }`}
         >
           {caption}
         </p>
       </main>
 
-      {/* Conversation transcript — distinct bubbles per speaker, scrollable */}
       {messages.length > 0 && (
         <div
           ref={scrollRef}
           className="transcript shrink-0 w-full max-w-md mx-auto px-5 pt-3 pb-2 overflow-y-auto flex flex-col gap-3 max-h-[32vh]"
         >
           {messages.map((m, i) => {
-            const isAbhi = m.role === "assistant";
+            const isAssistant = m.role === "assistant";
             const isSpeakingNow =
-              isAbhi && status === "speaking" && i === messages.length - 1;
+              isAssistant && status === "speaking" && i === messages.length - 1;
             return (
               <div
                 key={i}
                 className={`flex items-end gap-2 ${
-                  isAbhi ? "self-start" : "self-end flex-row-reverse"
+                  isAssistant ? "self-start" : "self-end flex-row-reverse"
                 }`}
               >
-                {isAbhi && <span className="msg-orb" aria-hidden />}
+                {isAssistant && <span className="msg-orb" aria-hidden />}
                 <div
                   className={`bubble ${
-                    isAbhi ? "bubble-abhi" : "bubble-user"
+                    isAssistant ? "bubble-abhi" : "bubble-user"
                   } ${isSpeakingNow ? "bubble-speaking" : ""}`}
                 >
                   {m.content}
@@ -299,7 +375,6 @@ export function VoiceChat({ persona }: { persona: Persona }) {
         </div>
       )}
 
-      {/* Hint */}
       <footer className="shrink-0 text-center pb-8 pt-3">
         <p className="text-neutral-600 text-xs tracking-wide h-4">{hint}</p>
       </footer>
