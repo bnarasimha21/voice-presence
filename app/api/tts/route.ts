@@ -3,7 +3,7 @@ import { providers } from "@/lib/providers";
 import { ProviderError } from "@/lib/providers/types";
 import { config, isProduction } from "@/lib/config";
 import { errorResponse, lookupPersona, parseJson, validateTtsBody } from "@/lib/validate";
-import { markTokenRedeemed, verifyReplyToken } from "@/lib/turn-token";
+import { markTokenRedeemed, releaseRedeemedToken, verifyReplyToken } from "@/lib/turn-token";
 import {
   checkRateLimit,
   isDailyBudgetExceeded,
@@ -13,6 +13,7 @@ import {
 } from "@/lib/limits";
 import { attachSessionCookie, resolveSession, sameOriginCheck } from "@/lib/request-context";
 import { id3CommentFrame } from "@/lib/id3";
+import { getCachedCrisisAudio } from "@/lib/crisis-audio-cache";
 
 async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   const route = "/api/tts";
@@ -27,12 +28,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   if (isProduction() && !sameOriginCheck(req)) {
     logRequest({ route, status: 403, sessionId });
     return errorResponse(403, "cross_origin", "Cross-origin POSTs are not allowed.");
-  }
-
-  const rate = checkRateLimit(`tts:${sessionId}`);
-  if (!rate.allowed) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
   }
 
   const parsed = await parseJson(req);
@@ -63,9 +58,29 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     return errorResponse(400, "invalid_token", "Reply token is invalid or expired.");
   }
 
+  // Adversarial-review follow-up on finding 6: the rate limit used to run
+  // before the token (and therefore isCrisis) was even known, so a
+  // crisis reply's audio could 429 here from ordinary rate-limit
+  // pressure, exactly the failure mode finding 6 exists to prevent on
+  // /api/chat and /api/turn. The token is verified above first (cheap:
+  // no provider call, just signature verification), so isCrisis is known
+  // before any limit is applied; a crisis reply, like the budget check
+  // below, bypasses this limiter entirely.
+  if (!verified.payload.isCrisis) {
+    const rate = checkRateLimit(`tts:${sessionId}`);
+    if (!rate.allowed) {
+      logRequest({ route, status: 429, sessionId });
+      return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
+    }
+  }
+
   // Issue 11: single-use. Redeeming the same token twice (a replay of a
   // captured token within its TTL) is rejected outright, before any
-  // provider call, rather than re-billing synthesis on every replay.
+  // provider call, rather than re-billing synthesis on every replay. This
+  // reserves the token now (so a concurrent replay cannot sneak in while
+  // synthesis is in flight); finding 7 below releases it again if
+  // synthesis actually fails, so a transient provider failure does not
+  // permanently burn a token that was never successfully redeemed.
   if (!markTokenRedeemed(validated.value.replyToken, verified.payload.exp)) {
     logRequest({ route, status: 400, sessionId, reason: "token_replayed" });
     return errorResponse(400, "invalid_token", "Reply token has already been used.");
@@ -112,6 +127,45 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   }
 
   try {
+    // Cost/abuse finding: a crisis reply's text is a fixed constant per
+    // persona, so its audio is synthesized once and served from cache on
+    // every subsequent trigger, instead of re-paying the real TTS
+    // provider for the same bytes every time. See
+    // lib/crisis-audio-cache.ts. A cache/synthesis failure here still
+    // falls through to the same error handling as an ordinary provider
+    // failure below.
+    if (isCrisis) {
+      let cached;
+      try {
+        cached = await getCachedCrisisAudio(providers().tts, {
+          text,
+          voiceId: persona.voiceId,
+          model: config.ttsModel,
+          outputFormat: config.ttsOutputFormat,
+        });
+      } catch (err) {
+        // Finding 7: synthesis failed, so this token was never actually
+        // redeemed; release it so the same token can be retried instead
+        // of forcing a whole new /api/chat round trip for a crisis reply.
+        releaseRedeemedToken(validated.value.replyToken);
+        throw err;
+      }
+
+      logRequest({ route, status: 200, sessionId, personaId: persona.id, chars: text.length });
+
+      const idTag = id3CommentFrame("AI-generated voice. Not a recording of a real person speaking live.");
+      const withTag = new Uint8Array(idTag.length + cached.bytes.length);
+      withTag.set(idTag, 0);
+      withTag.set(cached.bytes, idTag.length);
+
+      return new Response(withTag, {
+        headers: {
+          "Content-Type": cached.contentType,
+          "X-AI-Generated-Voice": "true",
+        },
+      });
+    }
+
     let result;
     try {
       result = await providers().tts.synthesize({
@@ -122,7 +176,22 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
         signal: req.signal,
       });
     } catch (err) {
-      if (!isCrisis) releaseBudget("ttsChars", text.length);
+      // Adversarial-review follow-up on finding 7: releasing the token
+      // unconditionally on any synthesis failure means the client itself
+      // can manufacture the failure by aborting the request after it has
+      // already reached the real provider (synthesize is given
+      // req.signal above), then retry with the same token, over and
+      // over, paying the provider nothing each time while still forcing
+      // a real call every round. A client-initiated abort is not a
+      // provider/infra failure, so it does not get the retry-friendly
+      // treatment: the budget stays spent and the token stays redeemed,
+      // same as a normal success, closing that loop. A genuine provider
+      // failure (anything the client did not cause) still releases both,
+      // same as before.
+      if (!req.signal.aborted) {
+        releaseBudget("ttsChars", text.length);
+        releaseRedeemedToken(validated.value.replyToken);
+      }
       throw err;
     }
 

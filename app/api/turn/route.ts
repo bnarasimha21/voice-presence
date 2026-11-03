@@ -17,6 +17,7 @@ import { attachSessionCookie, resolveSession, sameOriginCheck } from "@/lib/requ
 import { SentenceChunker } from "@/lib/chunker";
 import { TurnTiming } from "@/lib/timing";
 import { id3CommentFrame } from "@/lib/id3";
+import { getCachedCrisisAudio } from "@/lib/crisis-audio-cache";
 
 // Issue 4: one streaming turn. Replaces the three client round trips
 // (/api/stt -> /api/chat -> /api/tts) with a single NDJSON stream of
@@ -53,13 +54,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   if (isProduction() && !sameOriginCheck(req)) {
     logRequest({ route, status: 403, sessionId });
     return errorResponse(403, "cross_origin", "Cross-origin POSTs are not allowed.");
-  }
-  const rate = checkRateLimit(`turn:${sessionId}`);
-  if (!rate.allowed) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "rate_limited", "Too many requests.", {
-      "Retry-After": String(rate.retryAfterSeconds),
-    });
   }
   const parsed = await parseJson(req);
   if (!parsed.ok) {
@@ -111,14 +105,15 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     "AI-generated voice. Not a recording of a real person speaking live."
   );
 
-  // Issue 1 / 2 / 3: crisis detection runs on the user's messages before
-  // the model is ever called, and deliberately before the daily budget
-  // and per-session turn cap below: those are cost/abuse controls, not
-  // safety controls, and must never be the reason a crisis safety reply
-  // does not go out. When it trips, the fixed safety reply is the entire
-  // turn: it is the only text streamed to the client and the only thing
-  // synthesized to audio, so the spoken output always carries the safety
-  // line and it is never at risk of truncation.
+  // Issue 1 / 2 / 3 / finding 6: crisis detection runs on the user's
+  // messages before the model is ever called, and before anything that
+  // is a cost/abuse control rather than a safety control: the rate
+  // limiter, the daily budget, and the per-session turn cap below. None
+  // of those must ever be the reason a crisis safety reply does not go
+  // out. When it trips, the fixed safety reply is the entire turn: it is
+  // the only text streamed to the client and the only thing synthesized
+  // to audio, so the spoken output always carries the safety line and it
+  // is never at risk of truncation.
   if (crisisTriggeredInMessages(messages)) {
     const reply = crisisSafetyReply();
     const stream = new ReadableStream<Uint8Array>({
@@ -131,15 +126,19 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
           // the day's usage budget. A budget check could otherwise cause
           // the single most important audio output in this app to be
           // silently dropped.
-          const result = await tts.synthesize({
+          //
+          // Cost/abuse finding: this text is the exact same constant for
+          // every trigger of a given persona, so it is synthesized once
+          // and cached rather than paying the real TTS provider on every
+          // "kms" message. See lib/crisis-audio-cache.ts.
+          const cached = await getCachedCrisisAudio(tts, {
             text: reply,
             voiceId: activePersona.voiceId,
             model: config.ttsModel,
             outputFormat: config.ttsOutputFormat,
           });
           timing.mark("tts_first_byte");
-          const bytes = await streamToBytes(result.stream);
-          const withTag = concatBytes(disclosureTag, bytes);
+          const withTag = concatBytes(disclosureTag, cached.bytes);
           timing.mark("first_audio_sent");
           controller.enqueue(
             encodeEvent({ type: "audio", data: Buffer.from(withTag).toString("base64") })
@@ -159,6 +158,14 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
         "Content-Type": "application/x-ndjson",
         "X-AI-Generated-Voice": "true",
       },
+    });
+  }
+
+  const rate = checkRateLimit(`turn:${sessionId}`);
+  if (!rate.allowed) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "rate_limited", "Too many requests.", {
+      "Retry-After": String(rate.retryAfterSeconds),
     });
   }
 

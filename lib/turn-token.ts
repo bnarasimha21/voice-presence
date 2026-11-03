@@ -131,6 +131,23 @@ export function markTokenRedeemed(token: string, exp: number, now: number = Date
   return true;
 }
 
+/**
+ * Finding 7 (adversarial review): /api/tts used to mark a token redeemed
+ * before attempting synthesis, so a single ElevenLabs failure (a timeout,
+ * a 5xx, anything transient) permanently burned the token: the caller's
+ * only recourse was asking /api/chat for a whole new reply, including a
+ * crisis safety reply, the one output this app can least afford to lose
+ * to a provider hiccup. Callers should reserve the token with
+ * markTokenRedeemed() before the provider call (keeping the
+ * anti-replay/anti-concurrent-redemption property), then call this to
+ * release it back to "not yet redeemed" if that call fails, so the exact
+ * same token can be retried. A call that succeeds must never call this:
+ * the token stays redeemed, which is what keeps it single-use.
+ */
+export function releaseRedeemedToken(token: string): void {
+  redeemedTokens.delete(token);
+}
+
 export function resetRedeemedTokens() {
   redeemedTokens.clear();
 }

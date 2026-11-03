@@ -38,12 +38,6 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     return errorResponse(403, "cross_origin", "Cross-origin POSTs are not allowed.");
   }
 
-  const rate = checkRateLimit(`chat:${sessionId}`);
-  if (!rate.allowed) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
-  }
-
   const parsed = await parseJson(req);
   if (!parsed.ok) {
     logRequest({ route, status: 400, sessionId });
@@ -71,19 +65,26 @@ async function handle(req: NextRequest, sessionId: string): Promise<Response> {
     );
   }
 
-  // Issue 1 / 2 / 3: crisis detection runs on the user's own messages,
-  // before the model is ever called, and deliberately before the daily
-  // budget and per-session turn cap below. Those two are cost/abuse
-  // controls, not safety controls, and must never be the reason a crisis
-  // safety reply does not go out. If it trips, the fixed safety reply is
-  // the entire turn: it is never run through the model, never appended
-  // to a model reply after the fact, and never subject to maxSpokenChars
-  // truncation (it is short by construction and is the whole output).
+  // Issue 1 / 2 / 3 / finding 6: crisis detection runs on the user's own
+  // messages, before the model is ever called, and before anything that
+  // is a cost/abuse control rather than a safety control: the rate
+  // limiter, the daily budget, and the per-session turn cap below. None
+  // of those must ever be the reason a crisis safety reply does not go
+  // out. If it trips, the fixed safety reply is the entire turn: it is
+  // never run through the model, never appended to a model reply after
+  // the fact, and never subject to maxSpokenChars truncation (it is
+  // short by construction and is the whole output).
   if (crisisTriggeredInMessages(messages)) {
     const reply = crisisSafetyReply();
     const replyToken = issueReplyToken(persona.id, reply, sessionId, true);
     logRequest({ route, status: 200, sessionId, personaId: persona.id, crisis: 1 });
     return Response.json({ reply, replyToken });
+  }
+
+  const rate = checkRateLimit(`chat:${sessionId}`);
+  if (!rate.allowed) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
   }
 
   if (isDailyBudgetExceeded()) {

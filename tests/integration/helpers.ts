@@ -8,6 +8,7 @@ import { FakeTtsProvider, type FakeTtsScript } from "@/lib/providers/fakes/tts";
 import { resetRateLimits, resetSessionTurns, resetDailyUsage } from "@/lib/limits";
 import { resetRedeemedTokens } from "@/lib/turn-token";
 import { signSessionCookie } from "@/lib/request-context";
+import { resetCrisisAudioCache } from "@/lib/crisis-audio-cache";
 
 export type FakeSet = {
   llm: FakeLlmProvider;
@@ -30,6 +31,7 @@ export function installFakes(scripts?: {
   resetSessionTurns();
   resetDailyUsage();
   resetRedeemedTokens();
+  resetCrisisAudioCache();
   return set;
 }
 
