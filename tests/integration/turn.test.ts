@@ -3,33 +3,35 @@ import { NextRequest } from "next/server";
 import { POST as sttHandler } from "@/app/api/stt/route";
 import { POST as chatHandler } from "@/app/api/chat/route";
 import { POST as ttsHandler } from "@/app/api/tts/route";
-import { installFakes, readAllBytes } from "./helpers";
+import { installFakes, readAllBytes, sessionCookieHeader } from "./helpers";
 
 // Issue 1 acceptance: a fixture audio blob through /api/stt, the
 // transcript through /api/chat, and the reply through /api/tts (all on
 // fake providers) produces a transcript, a non-empty reply and non-empty
 // audio bytes with audio/mpeg. This also exercises the issue 2 token
-// contract between /api/chat and /api/tts.
+// contract between /api/chat and /api/tts, carried by the same session
+// cookie a real browser would reuse across the three requests.
 
-function sttRequest(blob: Blob) {
+function sttRequest(blob: Blob, cookie: string) {
   return new NextRequest("http://localhost:3000/api/stt", {
     method: "POST",
+    headers: { cookie },
     body: blob,
   });
 }
 
-function chatRequest(personaId: string, messages: unknown[]) {
+function chatRequest(personaId: string, messages: unknown[], cookie: string) {
   return new NextRequest("http://localhost:3000/api/chat", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie },
     body: JSON.stringify({ personaId, messages }),
   });
 }
 
-function ttsRequest(replyToken: string) {
+function ttsRequest(replyToken: string, cookie: string) {
   return new NextRequest("http://localhost:3000/api/tts", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie },
     body: JSON.stringify({ replyToken }),
   });
 }
@@ -43,22 +45,23 @@ describe("full turn: stt -> chat -> tts on fake providers", () => {
   });
 
   it("produces a transcript, a non-empty reply and non-empty mpeg audio", async () => {
+    const cookie = sessionCookieHeader("session-full-turn-fixture");
     const fixtureAudio = new Blob([new Uint8Array([1, 2, 3, 4])], { type: "audio/webm" });
 
-    const sttRes = await sttHandler(sttRequest(fixtureAudio));
+    const sttRes = await sttHandler(sttRequest(fixtureAudio, cookie));
     expect(sttRes.status).toBe(200);
     const { transcript } = await sttRes.json();
     expect(transcript).toBe("hello there, how are you");
 
     const chatRes = await chatHandler(
-      chatRequest("abhi", [{ role: "user", content: transcript }])
+      chatRequest("abhi", [{ role: "user", content: transcript }], cookie)
     );
     expect(chatRes.status).toBe(200);
     const { reply, replyToken } = await chatRes.json();
     expect(reply.length).toBeGreaterThan(0);
     expect(typeof replyToken).toBe("string");
 
-    const ttsRes = await ttsHandler(ttsRequest(replyToken));
+    const ttsRes = await ttsHandler(ttsRequest(replyToken, cookie));
     expect(ttsRes.status).toBe(200);
     expect(ttsRes.headers.get("content-type")).toBe("audio/mpeg");
     expect(ttsRes.headers.get("x-ai-generated-voice")).toBe("true");

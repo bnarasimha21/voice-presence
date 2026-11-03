@@ -6,6 +6,8 @@ import { FakeLlmProvider, type FakeLlmScript } from "@/lib/providers/fakes/llm";
 import { FakeSttProvider, type FakeSttScript } from "@/lib/providers/fakes/stt";
 import { FakeTtsProvider, type FakeTtsScript } from "@/lib/providers/fakes/tts";
 import { resetRateLimits, resetSessionTurns, resetDailyUsage } from "@/lib/limits";
+import { resetRedeemedTokens } from "@/lib/turn-token";
+import { signSessionCookie } from "@/lib/request-context";
 
 export type FakeSet = {
   llm: FakeLlmProvider;
@@ -27,7 +29,18 @@ export function installFakes(scripts?: {
   resetRateLimits();
   resetSessionTurns();
   resetDailyUsage();
+  resetRedeemedTokens();
   return set;
+}
+
+/**
+ * A signed session cookie header for a fixed, caller-chosen session id, so
+ * a test can make several requests (e.g. /api/chat then /api/tts) that
+ * the server resolves to the same session, matching how a real browser
+ * reuses one cookie across a conversation.
+ */
+export function sessionCookieHeader(sessionId: string): string {
+  return `vp_session=${signSessionCookie(sessionId)}`;
 }
 
 export async function readAllBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {

@@ -3,18 +3,18 @@ import { providers } from "@/lib/providers";
 import { ProviderError } from "@/lib/providers/types";
 import { config, isProduction } from "@/lib/config";
 import { errorResponse, lookupPersona, parseJson, validateTtsBody } from "@/lib/validate";
-import { verifyReplyToken } from "@/lib/turn-token";
+import { markTokenRedeemed, verifyReplyToken } from "@/lib/turn-token";
 import {
   checkRateLimit,
   isDailyBudgetExceeded,
   logRequest,
-  recordTtsUsage,
+  releaseBudget,
+  reserveBudget,
 } from "@/lib/limits";
-import { sessionIdFromRequest, sameOriginCheck } from "@/lib/request-context";
+import { attachSessionCookie, resolveSession, sameOriginCheck } from "@/lib/request-context";
 import { id3CommentFrame } from "@/lib/id3";
 
-export async function POST(req: NextRequest) {
-  const sessionId = sessionIdFromRequest(req);
+async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   const route = "/api/tts";
 
   // Issue 2: kill switch. Checked first and returns immediately, before
@@ -60,6 +60,22 @@ export async function POST(req: NextRequest) {
     return errorResponse(400, "invalid_token", "Reply token is invalid or expired.");
   }
 
+  // Issue 11: the token is bound to the session that minted it. A token
+  // captured from, or shared by, a different session cannot be redeemed
+  // here even while it is still within its TTL.
+  if (verified.payload.sessionId !== sessionId) {
+    logRequest({ route, status: 400, sessionId, reason: "session_mismatch" });
+    return errorResponse(400, "invalid_token", "Reply token is invalid or expired.");
+  }
+
+  // Issue 11: single-use. Redeeming the same token twice (a replay of a
+  // captured token within its TTL) is rejected outright, before any
+  // provider call, rather than re-billing synthesis on every replay.
+  if (!markTokenRedeemed(validated.value.replyToken, verified.payload.exp)) {
+    logRequest({ route, status: 400, sessionId, reason: "token_replayed" });
+    return errorResponse(400, "invalid_token", "Reply token has already been used.");
+  }
+
   const persona = lookupPersona(verified.payload.personaId);
   if (!persona) {
     logRequest({ route, status: 400, sessionId });
@@ -76,15 +92,30 @@ export async function POST(req: NextRequest) {
 
   const text = verified.payload.text;
 
-  try {
-    const result = await providers().tts.synthesize({
-      text,
-      voiceId: persona.voiceId,
-      model: config.ttsModel,
-      outputFormat: config.ttsOutputFormat,
-    });
+  // Issue 6: the ttsChars amount is known exactly up front (the text's
+  // own length), so this reserves it atomically before the provider call
+  // and releases it if the call fails, closing the same check-then-record
+  // race the LLM token budget had.
+  if (!reserveBudget("ttsChars", text.length)) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
+  }
 
-    recordTtsUsage(text.length);
+  try {
+    let result;
+    try {
+      result = await providers().tts.synthesize({
+        text,
+        voiceId: persona.voiceId,
+        model: config.ttsModel,
+        outputFormat: config.ttsOutputFormat,
+        signal: req.signal,
+      });
+    } catch (err) {
+      releaseBudget("ttsChars", text.length);
+      throw err;
+    }
+
     logRequest({ route, status: 200, sessionId, personaId: persona.id, chars: text.length });
 
     // Issue 3: layered, honest disclosure. A header and an ID3 comment
@@ -107,6 +138,12 @@ export async function POST(req: NextRequest) {
     logRequest({ route, status: 500, sessionId });
     return errorResponse(500, "internal_error", "Something went wrong.");
   }
+}
+
+export async function POST(req: NextRequest) {
+  const session = resolveSession(req);
+  const res = await handle(req, session.sessionId);
+  return attachSessionCookie(res, session);
 }
 
 function prependBytes(
