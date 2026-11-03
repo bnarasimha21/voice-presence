@@ -7,11 +7,34 @@
 function synchsafe(size: number): Uint8Array {
   // ID3v2 sizes are encoded as four 7-bit bytes (no byte may have its top
   // bit set), so the tag's own length never collides with a frame sync.
+  // Used for the TAG header size in every ID3v2 version (2.2 through
+  // 2.4). Frame sizes, below, are a different story: see uint32BE.
   return new Uint8Array([
     (size >> 21) & 0x7f,
     (size >> 14) & 0x7f,
     (size >> 7) & 0x7f,
     size & 0x7f,
+  ]);
+}
+
+// Issue 14: the FRAME size field's encoding depends on the tag version.
+// ID3v2.4 made frame sizes synchsafe, like the tag header size, but
+// ID3v2.3 (the version this file declares in the tag header, 0x03 0x00)
+// never did: a 2.3 frame size is a plain 32-bit big-endian integer. Using
+// `synchsafe()` for the frame size while declaring version 2.3 (as an
+// earlier version of this file did) only happens to produce the right
+// bytes while the comment is short enough that every byte of the length
+// is below 128; a long enough disclosure comment pushes the real length
+// past what 4x7 synchsafe bits can represent without the plain and
+// synchsafe encodings diverging, and a spec-correct 2.3 reader parsing
+// those bytes as a plain integer then reads the wrong frame length and
+// misparses (or truncates) the tag.
+function uint32BE(size: number): Uint8Array {
+  return new Uint8Array([
+    (size >>> 24) & 0xff,
+    (size >>> 16) & 0xff,
+    (size >>> 8) & 0xff,
+    size & 0xff,
   ]);
 }
 
@@ -30,7 +53,7 @@ export function id3CommentFrame(comment: string): Uint8Array {
 
   const frameHeader = concat([
     new TextEncoder().encode("COMM"),
-    synchsafe(frameBody.length),
+    uint32BE(frameBody.length), // plain 32-bit BE: correct for v2.3, see uint32BE above
     new Uint8Array([0x00, 0x00]), // frame flags
   ]);
 
