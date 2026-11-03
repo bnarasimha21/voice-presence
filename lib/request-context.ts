@@ -7,8 +7,33 @@
 // this server's secret, so the session id a client presents is either the
 // one the server gave it or not trusted at all (in which case a fresh one
 // is issued).
+//
+// Finding 4 (adversarial review, second pass): that fix left a different
+// hole open. When no valid cookie is presented, resolveSession used to
+// hand back a brand-new random UUID as the id used for THIS request's
+// rate limit / turn cap checks. A client that simply never sends the
+// cookie back (trivial: omit it, or use a fresh HTTP client per request)
+// got a brand-new, never-before-seen id, and therefore a brand-new
+// budget, on every single request: the turn cap and rate limiter never
+// actually bound anything for a cookie-less caller.
+//
+// Fixed the same way lead-generator's app/request_guard.py binds
+// anonymous callers to an IP instead of a client-rotatable value: when
+// there is no valid session cookie, the id used for *this* request's
+// limits is derived from the client's IP, read as the RIGHT-MOST entry of
+// X-Forwarded-For. This app, like lead-generator, is only ever reachable
+// through its platform's own reverse proxy (a single trusted hop), which
+// appends its own observed peer address as the last entry of
+// X-Forwarded-For; it does not strip whatever a client prepended. Taking
+// the right-most entry trusts exactly that one hop and ignores every
+// value the client itself could have put in the header, so a client can
+// no longer get a fresh limits bucket by sending a fake X-Forwarded-For.
+// A fresh signed cookie is still issued on the response so well-behaved
+// clients converge onto a stable per-browser session on their very next
+// request, same as before; only the cookie-less request itself now falls
+// back to a shared-per-IP bucket instead of an unbounded fresh one.
 
-import { createHmac, randomUUID, timingSafeEqual } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import { NextRequest } from "next/server";
 import { config, isProduction } from "@/lib/config";
 
@@ -36,9 +61,26 @@ export function signSessionCookie(
 export function verifySessionCookie(value: string | undefined | null): string | null {
   if (!value) return null;
   if (!sessionSecret()) return null; // no secret configured: never trust a client-presented id
+
+  // Finding 4 follow-up (adversarial review, second pass): a naive
+  // `value.split(".")` expecting exactly 3 parts broke the moment
+  // sessionId itself could contain a dot, which it now can: the
+  // cookie-less fallback id is `ip:<dotted-decimal address>`
+  // (lib/request-context.ts's resolveSession), and a dotted-decimal IPv4
+  // address has three dots of its own. A cookie issued for that id used
+  // to fail its own round-trip verification (parts.length was 6, not
+  // 3), so every cookie-less client's "stable" cookie was silently
+  // rejected on its very next request and treated as if it had never
+  // presented one. The last two dot-separated segments are always
+  // exp and sig (neither of which this module ever puts a literal "."
+  // into: exp is a plain decimal number, sig is base64url, which does
+  // not include "."); everything before that, rejoined on ".", is the
+  // session id, however many dots it contains.
   const parts = value.split(".");
-  if (parts.length !== 3) return null;
-  const [sessionId, expStr, sig] = parts;
+  if (parts.length < 3) return null;
+  const sig = parts[parts.length - 1];
+  const expStr = parts[parts.length - 2];
+  const sessionId = parts.slice(0, parts.length - 2).join(".");
   if (!sessionId || !expStr || !sig) return null;
 
   let expected: string;
@@ -65,16 +107,72 @@ export type SessionContext = {
 };
 
 /**
- * Resolves the session for this request from its signed cookie, issuing a
- * fresh random id (to be set on the response) if there is none or it does
- * not verify. Never derived from a client-supplied header.
+ * The client IP this request should be bounded under when it has no
+ * valid session cookie: the RIGHT-MOST entry of X-Forwarded-For, which is
+ * the one hop that can actually reach this process (see the finding-4
+ * note above). Falls back to a fixed "unknown" bucket when no
+ * X-Forwarded-For header is present at all (e.g. local dev with no proxy
+ * in front), matching lead-generator's fallback to the raw ASGI peer
+ * address for the same situation.
+ */
+// Adversarial-review follow-up: the right-most X-Forwarded-For entry used
+// to be trusted verbatim as the literal text of the session id, which
+// then gets written into a Set-Cookie header (attachSessionCookie) and
+// into the HMAC payload. The one trusted hop (the platform's own reverse
+// proxy) only ever appends a real IPv4/IPv6 address there, but nothing
+// stops a misconfigured proxy, or this falling back to local dev with no
+// proxy in front at all, from putting arbitrary attacker-controlled text
+// in that position; a "," itself cannot smuggle a second cookie (the
+// comma is the X-Forwarded-For delimiter, not a cookie-attribute
+// delimiter), but there is no reason to trust arbitrary characters here
+// when the only legitimate values are IP addresses. Only characters that
+// can appear in an IPv4 or IPv6 address are accepted; anything else
+// falls back to the fixed "unknown" bucket, same as a missing header.
+const IP_SHAPE_RE = /^[0-9a-fA-F:.]+$/;
+
+export function clientIp(req: NextRequest): string {
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const parts = xff
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (last && IP_SHAPE_RE.test(last)) return last;
+  }
+  return "unknown";
+}
+
+/**
+ * Resolves the session for this request from its signed cookie. When
+ * there is none, or it does not verify, THIS request's id for rate
+ * limits/turn caps falls back to a per-IP key (clientIp above), never to
+ * an unbounded fresh random id.
+ *
+ * Adversarial-review follow-up on finding 4: the first version of this
+ * fix still issued a *fresh random UUID* as the cookie to set on the
+ * response, even while using the IP-derived id for the current request.
+ * That UUID is a validly signed cookie the moment it is issued, so a
+ * client that captures it and sends it back on the next request gets an
+ * entirely new, never-before-seen sessionId, with its own fresh turn cap
+ * and fresh rate-limit bucket, independent of the IP bucket, for free.
+ * Repeating "request cookie-less, harvest the new cookie, spend it once,
+ * discard it, repeat" re-opens exactly the unbounded-identity-minting
+ * hole finding 4 exists to close, just one request later.
+ *
+ * Fixed by never minting a fresh random id for a cookie-less request at
+ * all: the cookie issued encodes the SAME ip-derived id already used for
+ * this request. A client that later sends that cookie back converges
+ * onto the identical "ip:<address>" session it would have resolved to
+ * anyway, so there is no way to parlay a cookie-less request into a
+ * brand-new identity.
  */
 export function resolveSession(req: NextRequest): SessionContext {
   const raw = req.cookies.get(SESSION_COOKIE)?.value;
   const verified = verifySessionCookie(raw);
   if (verified) return { sessionId: verified };
-  const fresh = randomUUID();
-  return { sessionId: fresh, cookieToIssue: fresh };
+  const fallback = `ip:${clientIp(req)}`;
+  return { sessionId: fallback, cookieToIssue: fallback };
 }
 
 /**

@@ -33,6 +33,41 @@ export const config = {
   maxTurnsPerSession: int("MAX_TURNS_PER_SESSION", 60),
   rateLimitWindowMs: int("RATE_LIMIT_WINDOW_MS", 60_000),
   rateLimitMax: int("RATE_LIMIT_MAX", 20),
+  // Finding 4 (adversarial review, second pass): the rate-limit buckets
+  // map had no expiry at all, unlike sessionTurns below. Once Finding 4's
+  // IP fallback in lib/request-context.ts started handing out stable,
+  // reused keys (e.g. "ip:1.2.3.4") instead of a fresh UUID per
+  // cookie-less request, an entry for a given key is created once and
+  // then never removed, even long after that IP stopped sending
+  // requests. A TTL well past the rate-limit window itself (so it never
+  // interferes with an in-progress window) plus the same cap-eviction
+  // pattern as sessionTurns keeps this map bounded.
+  rateLimitBucketTtlMs: int("RATE_LIMIT_BUCKET_TTL_MS", 10 * 60_000), // 10 min
+
+  // Finding 4 follow-up (adversarial review, second pass): /api/stt is
+  // the one route a crisis message must pass through before the crisis
+  // check can even run (the UI is voice-only). The default rateLimitMax
+  // (20/min) is sized for a single browser's own turns; sharing it
+  // verbatim for the per-IP fallback key means several real people
+  // behind one NAT, or any client reaching this app through a CDN/proxy
+  // that does not forward a usable X-Forwarded-For, can exhaust it on
+  // ordinary use and then have a genuine crisis utterance 429 before it
+  // is ever transcribed. STT is no longer gated by the daily budget
+  // (finding 2), so a materially higher per-key ceiling here still
+  // bounds cost/abuse without making shared-IP crisis transcription the
+  // first thing to break.
+  sttRateLimitMax: int("STT_RATE_LIMIT_MAX", 60),
+
+  // Adversarial-review follow-up on finding 3: the crisis-audio cache
+  // (lib/crisis-audio-cache.ts) dedupes concurrent first-use synthesis
+  // calls behind a single in-flight promise, so a slow/stalled provider
+  // response now blocks every crisis trigger across every session, not
+  // just the one caller that happened to go first (before the cache
+  // existed, each request made its own independent provider call). A
+  // bounded timeout on that one synthesis call means a stalled provider
+  // fails fast instead of leaving every waiting crisis reply silent for
+  // minutes; the next caller then gets a fresh attempt.
+  crisisAudioTimeoutMs: int("CRISIS_AUDIO_TIMEOUT_MS", 15_000),
   dailyBudgetLlmTokens: int("DAILY_BUDGET_LLM_TOKENS", 500_000),
   dailyBudgetSttSeconds: int("DAILY_BUDGET_STT_SECONDS", 7200),
   dailyBudgetTtsChars: int("DAILY_BUDGET_TTS_CHARS", 500_000),

@@ -11,6 +11,28 @@ import { config } from "@/lib/config";
 type Bucket = { tokens: number; windowStart: number };
 const buckets = new Map<string, Bucket>();
 
+// Finding 4 (adversarial review, second pass): bounded and self-expiring,
+// same pattern as sweepSessionTurns below. Before this, a key that
+// resolveSession (lib/request-context.ts) hands out for a cookie-less
+// request (now a stable "ip:<address>" key, not a fresh UUID per
+// request) created one entry here forever: nothing ever deleted it, so
+// the map grew by one distinct key per distinct client IP ever seen,
+// without bound, for the lifetime of the process.
+function sweepBuckets(now: number) {
+  const ttl = config.rateLimitBucketTtlMs;
+  for (const [key, bucket] of buckets) {
+    if (now - bucket.windowStart > ttl) buckets.delete(key);
+  }
+  const max = config.maxSessionEntries;
+  if (buckets.size > max) {
+    const oldestFirst = [...buckets.entries()].sort(
+      (a, b) => a[1].windowStart - b[1].windowStart
+    );
+    const excess = buckets.size - max;
+    for (let i = 0; i < excess; i++) buckets.delete(oldestFirst[i][0]);
+  }
+}
+
 export type RateLimitResult =
   | { allowed: true }
   | { allowed: false; retryAfterSeconds: number };
@@ -21,10 +43,15 @@ export function checkRateLimit(
   windowMs: number = config.rateLimitWindowMs
 ): RateLimitResult {
   const now = Date.now();
+  sweepBuckets(now);
   const bucket = buckets.get(key);
 
   if (!bucket || now - bucket.windowStart >= windowMs) {
     buckets.set(key, { tokens: 1, windowStart: now });
+    // Sweep again after inserting: a brand-new key is what can push this
+    // map over the cap, so the cap-eviction pass must see it to actually
+    // bring the map back down to size, not just to one-over on this call.
+    sweepBuckets(now);
     return { allowed: true };
   }
 
@@ -41,6 +68,11 @@ export function checkRateLimit(
 
 export function resetRateLimits() {
   buckets.clear();
+}
+
+/** Test-only: how many live entries the rate-limit buckets map currently holds. */
+export function bucketsSize(): number {
+  return buckets.size;
 }
 
 // ---- Per-session turn counting -------------------------------------------
