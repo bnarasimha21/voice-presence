@@ -8,10 +8,19 @@ export class DeepgramSttProvider implements SttProvider {
 
     let res: Response;
     try {
+      // Finding 2 (third adversarial review): this used to hardcode
+      // `language=en`. The UI is voice-only (components/VoiceChat.tsx),
+      // so a Spanish or Hindi speaker in genuine crisis was transcribed
+      // as garbled English text that could never match the Spanish /
+      // Devanagari crisis patterns in lib/personas/prompt.ts, making
+      // those patterns dead code for any real, non-English speaker.
+      // `detect_language=true` tells Deepgram to auto-detect the spoken
+      // language per request instead of forcing every utterance through
+      // an English-only model.
       res = await fetch(
         `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(
           req.model
-        )}&smart_format=true&language=en`,
+        )}&smart_format=true&detect_language=true`,
         {
           method: "POST",
           headers: {
