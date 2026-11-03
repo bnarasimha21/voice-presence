@@ -16,11 +16,32 @@ function sleep(ms: number) {
 
 // Deterministic non-empty "audio" bytes derived from the text, so tests can
 // assert non-empty output without decoding real MP3/PCM.
+//
+// Finding 5 follow-up (third and fourth adversarial reviews): the
+// crisis-audio truncation check in lib/crisis-audio-cache.ts rejects a
+// synthesis result that is short relative to the input text's length and
+// the actual output format's bitrate (see minExpectedBytes there). The
+// old fixture produced roughly one byte per character (the marker prefix
+// plus the text itself), which a real encoded-speech provider never does
+// (real audio runs well over 1000 bytes per character at common voice
+// bitrates); against a realistic floor, this fixture's own crisis-path
+// tests would wrongly look truncated. The app's real crisis-audio call
+// site passes config.ttsOutputFormat (default "mp3_44100_128"), which
+// the dynamic floor resolves to 800 bytes/char at the default
+// assumedMaxSpeakingCharsPerSecond (20, tightened from 25 -- see
+// lib/config.ts finding 1, fourth adversarial review, fourth pass); this
+// fixture's multiplier stays comfortably above that new, tighter floor
+// so the fake provider's own crisis-path tests never trip the check
+// meant for a genuinely truncated real stream.
+const FIXTURE_BYTES_PER_CHAR = 1400;
+
 function fixtureAudioBytes(text: string): Uint8Array {
   const base = new TextEncoder().encode(`FAKE_AUDIO:${text}`);
-  // Pad so even very short text produces a plausible audio-sized payload.
-  const padded = new Uint8Array(Math.max(base.length, 32));
-  padded.set(base);
+  const target = Math.max(32, text.length * FIXTURE_BYTES_PER_CHAR);
+  const padded = new Uint8Array(target);
+  for (let i = 0; i < target; i++) {
+    padded[i] = base[i % base.length];
+  }
   return padded;
 }
 

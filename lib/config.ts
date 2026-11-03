@@ -58,6 +58,80 @@ export const config = {
   // first thing to break.
   sttRateLimitMax: int("STT_RATE_LIMIT_MAX", 60),
 
+  // Finding 5 (third adversarial review): lib/crisis-audio-cache.ts used
+  // to only reject a zero-length synthesis body before caching it, even
+  // though its own comment claimed "empty or truncated" bodies were
+  // rejected. A stream that ends early but cleanly (cut off mid-sentence,
+  // e.g. before the "call 988" line) is nonzero length and was cached as
+  // if it were the real, complete safety audio, then served on every
+  // future crisis trigger until the process restarted.
+  //
+  // Finding 5 follow-up (fourth adversarial review, two rounds): a flat
+  // bytes-per-char floor cannot do this job well, because real bytes/char
+  // depends entirely on TTS_OUTPUT_FORMAT's bitrate. A flat 20 was
+  // "theater" (only caught >98% truncation at the default 128kbps
+  // format). Raising it to a flat 300 fixed that for the default format,
+  // but then falsely rejected genuinely complete audio at a low-bitrate
+  // format (e.g. mp3_44100_32, 32kbps: full audio is only ~286
+  // bytes/char there, below a flat 300 floor) -- one env var away from
+  // every crisis trigger permanently failing to produce audio. One flat
+  // number cannot both avoid that false-reject and still catch a
+  // realistic partial truncation at the default bitrate.
+  //
+  // The real fix (lib/crisis-audio-cache.ts) now derives the floor from
+  // the actual output format's bitrate/sample rate, using
+  // assumedMaxSpeakingCharsPerSecond below as a deliberately fast
+  // (safety-margin) speaking rate, so the floor scales with whatever
+  // format is actually configured instead of assuming one bitrate.
+  // minCrisisAudioBytesPerChar is now only a fallback, used when the
+  // output format string cannot be parsed into a known bitrate/sample
+  // rate (so the dynamic calculation has nothing to divide), or when a
+  // deployer wants to force a specific value regardless of format.
+  minCrisisAudioBytesPerChar: int("MIN_CRISIS_AUDIO_BYTES_PER_CHAR", 300),
+
+  // Finding 5 follow-up (fourth adversarial review): the fastest realistic
+  // spoken rate assumed when deriving the crisis-audio truncation floor
+  // from an output format's bitrate (see lib/crisis-audio-cache.ts). This
+  // is deliberately on the fast side (most real speech is slower, closer
+  // to 12-15 chars/sec) so a genuinely fast voice reading complete audio
+  // is never mistaken for truncated audio; the resulting floor is still
+  // well below a typical-speed complete recording, leaving room to catch
+  // a real partial cut.
+  //
+  // Finding 1 (fourth adversarial review, third pass): 25 left too much
+  // slack. At the default 128kbps format, dividing by 25 gave a floor of
+  // only ~640 bytes/char, below half of a typical complete recording
+  // (~1250 bytes/char), so a stream that produced real audio for roughly
+  // 79% of the reply and then silently dropped only the trailing "call
+  // 988" resources sentence still cleared the floor and got cached as
+  // complete.
+  //
+  // Finding 1 (fourth adversarial review, fourth pass): the first fix for
+  // this lowered the value all the way to 16, which overcorrected. Plain
+  // conversational English already runs close to 15 chars/sec at ~150
+  // words/min (avg. word length ~5 chars + a space), and a brisk voice,
+  // or a voice sped up via the provider's own speed control, can exceed
+  // 20. A rejection here is NOT a hard failure: getCachedCrisisAudio's
+  // caller degrades to text-only on a cache miss/error rather than
+  // erroring the whole crisis reply. But this app's UI is voice-only, so
+  // "text-only" is a real degradation of the one safety path this app
+  // cannot afford to lose, not a cosmetic one, and at 16 a normal fast
+  // voice reading the fixed safety line could be misclassified as
+  // truncated EVERY time (same text, same voice, same result on every
+  // retry), silently losing crisis audio for that persona permanently
+  // until someone notices and raises this value by hand.
+  //
+  // Settled on 20: still comfortably at or above a brisk real speaking
+  // rate, so genuinely complete audio is not misread as truncated, while
+  // still tighter than the original 25 (catches losing roughly a third
+  // or more of the audio instead of needing to lose about half). This
+  // remains a heuristic byte-count comparison, not a real decode: a
+  // partial cut small enough to stay above whatever floor is configured
+  // will still get through, and an unusually fast voice configuration
+  // should raise this value further via env rather than rely on the
+  // default blindly.
+  assumedMaxSpeakingCharsPerSecond: int("ASSUMED_MAX_SPEAKING_CHARS_PER_SECOND", 20),
+
   // Adversarial-review follow-up on finding 3: the crisis-audio cache
   // (lib/crisis-audio-cache.ts) dedupes concurrent first-use synthesis
   // calls behind a single in-flight promise, so a slow/stalled provider
