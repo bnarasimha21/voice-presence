@@ -3,18 +3,20 @@ import { providers } from "@/lib/providers";
 import { ProviderError } from "@/lib/providers/types";
 import { config, isProduction } from "@/lib/config";
 import { errorResponse, lookupPersona, parseJson, validateChatBody } from "@/lib/validate";
-import { applyCrisisBackstop } from "@/lib/personas/prompt";
+import { crisisSafetyReply, crisisTriggeredInMessages } from "@/lib/personas/prompt";
 import {
   checkAndIncrementSessionTurns,
   checkRateLimit,
   isDailyBudgetExceeded,
   logRequest,
-  recordLlmUsage,
-  recordTtsUsage,
+  releaseBudget,
+  reserveBudget,
+  settleBudget,
 } from "@/lib/limits";
-import { sessionIdFromRequest, sameOriginCheck } from "@/lib/request-context";
+import { attachSessionCookie, resolveSession, sameOriginCheck } from "@/lib/request-context";
 import { SentenceChunker } from "@/lib/chunker";
 import { TurnTiming } from "@/lib/timing";
+import { id3CommentFrame } from "@/lib/id3";
 
 // Issue 4: one streaming turn. Replaces the three client round trips
 // (/api/stt -> /api/chat -> /api/tts) with a single NDJSON stream of
@@ -37,8 +39,11 @@ function encodeEvent(obj: unknown): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(obj) + "\n");
 }
 
-export async function POST(req: NextRequest) {
-  const sessionId = sessionIdFromRequest(req);
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.round(text.length / 4));
+}
+
+async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   const route = "/api/turn";
 
   if (!config.voiceEnabled) {
@@ -56,15 +61,6 @@ export async function POST(req: NextRequest) {
       "Retry-After": String(rate.retryAfterSeconds),
     });
   }
-  if (isDailyBudgetExceeded()) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
-  }
-  if (!checkAndIncrementSessionTurns(sessionId)) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "session_turn_limit", "Turn limit reached for this session.");
-  }
-
   const parsed = await parseJson(req);
   if (!parsed.ok) {
     logRequest({ route, status: 400, sessionId });
@@ -95,14 +91,98 @@ export async function POST(req: NextRequest) {
   // the same function.
   const activePersona = persona;
 
-  const lastUserMessage =
-    [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  // Issue 9: provider construction can throw (missing/invalid env config
+  // for the selected provider set). Doing this before any stream exists
+  // means a misconfiguration is a handled 500, not an uncaught exception
+  // that only surfaces once the ReadableStream's start() callback runs.
+  let llm: ReturnType<typeof providers>["llm"];
+  let tts: ReturnType<typeof providers>["tts"];
+  try {
+    const p = providers();
+    llm = p.llm;
+    tts = p.tts;
+  } catch {
+    logRequest({ route, status: 500, sessionId });
+    return errorResponse(500, "provider_config_error", "Voice is misconfigured. Please try again later.");
+  }
 
   const timing = new TurnTiming();
-  const { llm, tts } = providers();
+  const disclosureTag = id3CommentFrame(
+    "AI-generated voice. Not a recording of a real person speaking live."
+  );
+
+  // Issue 1 / 2 / 3: crisis detection runs on the user's messages before
+  // the model is ever called, and deliberately before the daily budget
+  // and per-session turn cap below: those are cost/abuse controls, not
+  // safety controls, and must never be the reason a crisis safety reply
+  // does not go out. When it trips, the fixed safety reply is the entire
+  // turn: it is the only text streamed to the client and the only thing
+  // synthesized to audio, so the spoken output always carries the safety
+  // line and it is never at risk of truncation.
+  if (crisisTriggeredInMessages(messages)) {
+    const reply = crisisSafetyReply();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encodeEvent({ type: "text_delta", text: reply }));
+        timing.mark("first_sentence");
+        try {
+          // Deliberately not gated on reserveBudget/isDailyBudgetExceeded:
+          // the crisis safety line must always be attempted regardless of
+          // the day's usage budget. A budget check could otherwise cause
+          // the single most important audio output in this app to be
+          // silently dropped.
+          const result = await tts.synthesize({
+            text: reply,
+            voiceId: activePersona.voiceId,
+            model: config.ttsModel,
+            outputFormat: config.ttsOutputFormat,
+          });
+          timing.mark("tts_first_byte");
+          const bytes = await streamToBytes(result.stream);
+          const withTag = concatBytes(disclosureTag, bytes);
+          timing.mark("first_audio_sent");
+          controller.enqueue(
+            encodeEvent({ type: "audio", data: Buffer.from(withTag).toString("base64") })
+          );
+        } catch {
+          // Even if TTS fails, the client still gets the safety text; do
+          // not let a synthesis failure hide the safety reply entirely.
+        }
+        timing.mark("turn_done");
+        controller.enqueue(encodeEvent({ type: "done", reply, timing: timing.toObject() }));
+        logRequest({ route, status: 200, sessionId, personaId: activePersona.id, crisis: 1 });
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/x-ndjson",
+        "X-AI-Generated-Voice": "true",
+      },
+    });
+  }
+
+  if (isDailyBudgetExceeded()) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
+  }
+  if (!checkAndIncrementSessionTurns(sessionId)) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "session_turn_limit", "Turn limit reached for this session.");
+  }
 
   const abortedByClient = new AbortController();
   req.signal.addEventListener("abort", () => abortedByClient.abort());
+
+  // Issue 6: reserve a worst-case token estimate before the provider call;
+  // settled (or released) once the real usage is known, or on failure.
+  // See lib/limits.ts for why this read-modify-write is atomic without a
+  // lock under Node's single-threaded event loop.
+  const estimatedTokens = estimateTokens(messages.map((m) => m.content).join(" ")) + config.maxReplyTokens;
+  if (!reserveBudget("llmTokens", estimatedTokens)) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "budget_exceeded", "Daily usage budget reached.");
+  }
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -110,6 +190,55 @@ export async function POST(req: NextRequest) {
       let fullText = "";
       let firstTokenSeen = false;
       let firstSentenceSeen = false;
+      let disclosureSent = false;
+      let spokenChars = 0;
+      // Issue 7: usage must be recorded even if TTS fails after the LLM
+      // succeeded, or if the client aborts mid-stream. This is set as
+      // soon as it is known, and the outer finally below settles the
+      // budget with whatever is here (falling back to a length estimate
+      // if the generator never finished), so the reservation above is
+      // never left dangling.
+      let usage: { inputTokens: number; outputTokens: number } | null = null;
+
+      // Issue 9: audio is capped at the same maxSpokenChars length used
+      // for the text reply, so a long model output cannot produce
+      // unbounded synthesized audio.
+      function remainingAudioBudget(): number {
+        return Math.max(0, config.maxSpokenChars - spokenChars);
+      }
+
+      async function speakSentence(sentence: string) {
+        const budget = remainingAudioBudget();
+        if (budget <= 0) return;
+        const toSpeak = sentence.length > budget ? sentence.slice(0, budget) : sentence;
+        if (!toSpeak) return;
+        // Issue 6: reserve the ttsChars amount (known exactly up front)
+        // before the provider call, same atomic pattern as /api/tts.
+        if (!reserveBudget("ttsChars", toSpeak.length)) return;
+        let result;
+        try {
+          result = await tts.synthesize({
+            text: toSpeak,
+            voiceId: activePersona.voiceId,
+            model: config.ttsModel,
+            outputFormat: config.ttsOutputFormat,
+            signal: abortedByClient.signal,
+          });
+        } catch (err) {
+          releaseBudget("ttsChars", toSpeak.length);
+          throw err;
+        }
+        timing.mark("tts_first_byte");
+        spokenChars += toSpeak.length;
+        const rawBytes = await streamToBytes(result.stream);
+        const bytes = disclosureSent ? rawBytes : concatBytes(disclosureTag, rawBytes);
+        disclosureSent = true;
+        timing.mark("first_audio_sent");
+        if (abortedByClient.signal.aborted) return;
+        controller.enqueue(
+          encodeEvent({ type: "audio", data: Buffer.from(bytes).toString("base64") })
+        );
+      }
 
       try {
         const gen = llm.chatStream({
@@ -117,30 +246,14 @@ export async function POST(req: NextRequest) {
           systemPrompt: activePersona.systemPrompt,
           messages,
           maxTokens: config.maxReplyTokens,
+          signal: abortedByClient.signal,
         });
-
-        async function speakSentence(sentence: string) {
-          const result = await tts.synthesize({
-            text: sentence,
-            voiceId: activePersona.voiceId,
-            model: config.ttsModel,
-            outputFormat: config.ttsOutputFormat,
-          });
-          timing.mark("tts_first_byte");
-          recordTtsUsage(sentence.length);
-          const bytes = await streamToBytes(result.stream);
-          timing.mark("first_audio_sent");
-          controller.enqueue(
-            encodeEvent({ type: "audio", data: Buffer.from(bytes).toString("base64") })
-          );
-        }
 
         // A plain `for await` discards an async generator's return value,
         // which is where chatStream puts the real input/output token
         // counts. Drive the iterator by hand so that value is not lost:
         // /api/chat bills on real usage from the provider, and this route
         // should too rather than falling back to a length estimate.
-        let usage: { inputTokens: number; outputTokens: number } | null = null;
         let step = await gen.next();
         while (!step.done) {
           const delta = step.value;
@@ -154,34 +267,40 @@ export async function POST(req: NextRequest) {
 
           const sentences = chunker.push(delta.text);
           for (const sentence of sentences) {
+            if (abortedByClient.signal.aborted) break;
             if (!firstSentenceSeen) {
               firstSentenceSeen = true;
               timing.mark("first_sentence");
             }
             await speakSentence(sentence);
           }
+          if (abortedByClient.signal.aborted) break;
           step = await gen.next();
         }
         if (step.done) {
           usage = { inputTokens: step.value.inputTokens, outputTokens: step.value.outputTokens };
         }
 
-        const trailing = chunker.flush();
-        if (trailing) {
-          if (!firstSentenceSeen) timing.mark("first_sentence");
-          await speakSentence(trailing);
+        // Issue 7: a client abort means no further audio should be
+        // synthesized, including the sentence chunker's trailing
+        // fragment. Flushing and speaking it after an abort was detected
+        // defeated the point of aborting.
+        if (!abortedByClient.signal.aborted) {
+          const trailing = chunker.flush();
+          if (trailing) {
+            if (!firstSentenceSeen) timing.mark("first_sentence");
+            await speakSentence(trailing);
+          }
         }
 
-        const reply = applyCrisisBackstop(lastUserMessage, fullText).slice(
-          0,
-          config.maxSpokenChars
-        );
-        recordLlmUsage(usage ? usage.inputTokens + usage.outputTokens : estimateTokens(fullText));
+        const reply = fullText.slice(0, config.maxSpokenChars);
         timing.mark("turn_done");
 
-        controller.enqueue(
-          encodeEvent({ type: "done", reply, timing: timing.toObject() })
-        );
+        if (!abortedByClient.signal.aborted) {
+          controller.enqueue(
+            encodeEvent({ type: "done", reply, timing: timing.toObject() })
+          );
+        }
         logRequest({ route, status: 200, sessionId, personaId: activePersona.id });
         controller.close();
       } catch (err) {
@@ -197,16 +316,30 @@ export async function POST(req: NextRequest) {
           logRequest({ route, status: 500, sessionId });
         }
         controller.close();
+      } finally {
+        // Issue 7: settle (or release) the reservation no matter which
+        // path got here: full success, a TTS failure after the LLM
+        // succeeded, a client abort, or an LLM failure. Real usage is
+        // used whenever the generator reported it; otherwise this falls
+        // back to an estimate of what was actually produced so far,
+        // which only ever overcounts slightly rather than leaking the
+        // reservation forever.
+        if (usage) {
+          settleBudget("llmTokens", estimatedTokens, usage.inputTokens + usage.outputTokens);
+        } else {
+          releaseBudget("llmTokens", estimatedTokens);
+          if (fullText) {
+            settleBudget("llmTokens", 0, estimateTokens(fullText));
+          }
+        }
       }
     },
     cancel() {
+      // Issue 7: no duck-typed `.cancel()` on the provider. Aborting this
+      // controller is what actually stops the real Anthropic/ElevenLabs
+      // calls in flight, via the AbortSignal threaded into every provider
+      // call above.
       abortedByClient.abort();
-      if ("cancel" in llm && typeof (llm as { cancel?: () => void }).cancel === "function") {
-        (llm as { cancel: () => void }).cancel();
-      }
-      if ("cancel" in tts && typeof (tts as { cancel?: () => void }).cancel === "function") {
-        (tts as { cancel: () => void }).cancel();
-      }
     },
   });
 
@@ -214,8 +347,15 @@ export async function POST(req: NextRequest) {
     headers: {
       "Content-Type": "application/x-ndjson",
       "Server-Timing": timing.toServerTimingHeader(),
+      "X-AI-Generated-Voice": "true",
     },
   });
+}
+
+export async function POST(req: NextRequest) {
+  const session = resolveSession(req);
+  const res = await handle(req, session.sessionId);
+  return attachSessionCookie(res, session);
 }
 
 async function streamToBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -237,6 +377,9 @@ async function streamToBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8A
   return out;
 }
 
-function estimateTokens(text: string): number {
-  return Math.max(1, Math.round(text.length / 4));
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
 }

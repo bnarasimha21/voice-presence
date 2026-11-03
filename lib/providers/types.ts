@@ -14,6 +14,8 @@ export type ChatRequest = {
   systemPrompt: string;
   messages: ChatMessage[];
   maxTokens: number;
+  /** Optional abort signal; a real provider must stop the in-flight request when it fires. */
+  signal?: AbortSignal;
 };
 
 export type ChatResult = {
@@ -37,6 +39,8 @@ export interface LlmProvider {
 export type SttRequest = {
   audio: Blob;
   model: string;
+  /** Optional abort signal; a real provider must stop the in-flight request when it fires. */
+  signal?: AbortSignal;
 };
 
 export type SttResult = {
@@ -53,6 +57,8 @@ export type TtsRequest = {
   voiceId: string;
   model: string;
   outputFormat: string;
+  /** Optional abort signal; a real provider must stop the in-flight request when it fires. */
+  signal?: AbortSignal;
 };
 
 export type TtsResult = {

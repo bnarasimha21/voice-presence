@@ -19,6 +19,7 @@ export class DeepgramSttProvider implements SttProvider {
             "Content-Type": req.audio.type || "audio/webm",
           },
           body: req.audio,
+          signal: req.signal,
         }
       );
     } catch (err) {

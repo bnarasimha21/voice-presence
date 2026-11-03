@@ -21,11 +21,17 @@ function getClient(): Anthropic {
   return client;
 }
 
+/** Test-only escape hatch: force a fresh client (e.g. one built with a fetch spy). */
+export function resetAnthropicClient(next: Anthropic | null = null) {
+  client = next;
+}
+
 export class AnthropicLlmProvider implements LlmProvider {
   async chat(req: ChatRequest): Promise<ChatResult> {
     try {
       const response = await getClient().messages.create(
-        buildMessagesRequest(req)
+        buildMessagesRequest(req),
+        { signal: req.signal }
       );
       const block = response.content[0];
       if (block.type !== "text") {
@@ -49,7 +55,9 @@ export class AnthropicLlmProvider implements LlmProvider {
     req: ChatRequest
   ): AsyncGenerator<StreamDelta, ChatResult, void> {
     try {
-      const stream = getClient().messages.stream(buildMessagesRequest(req));
+      const stream = getClient().messages.stream(buildMessagesRequest(req), {
+        signal: req.signal,
+      });
       let text = "";
       for await (const event of stream) {
         if (

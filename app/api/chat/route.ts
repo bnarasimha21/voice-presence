@@ -9,18 +9,23 @@ import {
   validateChatBody,
 } from "@/lib/validate";
 import { issueReplyToken } from "@/lib/turn-token";
-import { applyCrisisBackstop } from "@/lib/personas/prompt";
+import { crisisSafetyReply, crisisTriggeredInMessages } from "@/lib/personas/prompt";
 import {
   checkAndIncrementSessionTurns,
   checkRateLimit,
   isDailyBudgetExceeded,
   logRequest,
-  recordLlmUsage,
+  releaseBudget,
+  reserveBudget,
+  settleBudget,
 } from "@/lib/limits";
-import { sessionIdFromRequest, sameOriginCheck } from "@/lib/request-context";
+import { attachSessionCookie, resolveSession, sameOriginCheck } from "@/lib/request-context";
 
-export async function POST(req: NextRequest) {
-  const sessionId = sessionIdFromRequest(req);
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.round(text.length / 4));
+}
+
+async function handle(req: NextRequest, sessionId: string): Promise<Response> {
   const route = "/api/chat";
 
   if (!config.voiceEnabled) {
@@ -37,20 +42,6 @@ export async function POST(req: NextRequest) {
   if (!rate.allowed) {
     logRequest({ route, status: 429, sessionId });
     return errorResponse(429, "rate_limited", "Too many requests.", { "Retry-After": String(rate.retryAfterSeconds) });
-  }
-
-  if (isDailyBudgetExceeded()) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(
-      429,
-      "budget_exceeded",
-      "Daily usage budget reached. Please try again tomorrow."
-    );
-  }
-
-  if (!checkAndIncrementSessionTurns(sessionId)) {
-    logRequest({ route, status: 429, sessionId });
-    return errorResponse(429, "session_turn_limit", "Turn limit reached for this session.");
   }
 
   const parsed = await parseJson(req);
@@ -80,24 +71,63 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const lastUserMessage =
-    [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  // Issue 1 / 2 / 3: crisis detection runs on the user's own messages,
+  // before the model is ever called, and deliberately before the daily
+  // budget and per-session turn cap below. Those two are cost/abuse
+  // controls, not safety controls, and must never be the reason a crisis
+  // safety reply does not go out. If it trips, the fixed safety reply is
+  // the entire turn: it is never run through the model, never appended
+  // to a model reply after the fact, and never subject to maxSpokenChars
+  // truncation (it is short by construction and is the whole output).
+  if (crisisTriggeredInMessages(messages)) {
+    const reply = crisisSafetyReply();
+    const replyToken = issueReplyToken(persona.id, reply, sessionId);
+    logRequest({ route, status: 200, sessionId, personaId: persona.id, crisis: 1 });
+    return Response.json({ reply, replyToken });
+  }
+
+  if (isDailyBudgetExceeded()) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(
+      429,
+      "budget_exceeded",
+      "Daily usage budget reached. Please try again tomorrow."
+    );
+  }
+
+  if (!checkAndIncrementSessionTurns(sessionId)) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "session_turn_limit", "Turn limit reached for this session.");
+  }
+
+  // Issue 6: reserve a worst-case token estimate before the provider call
+  // and settle it to the real count afterward, so two concurrent requests
+  // cannot both pass a "check then record" gap and overshoot the daily
+  // budget. See lib/limits.ts for why this is safe without a lock.
+  const estimatedTokens = estimateTokens(messages.map((m) => m.content).join(" ")) + config.maxReplyTokens;
+  if (!reserveBudget("llmTokens", estimatedTokens)) {
+    logRequest({ route, status: 429, sessionId });
+    return errorResponse(429, "budget_exceeded", "Daily usage budget reached. Please try again tomorrow.");
+  }
 
   try {
-    const result = await providers().llm.chat({
-      model: config.llmModel,
-      systemPrompt: persona.systemPrompt,
-      messages,
-      maxTokens: config.maxReplyTokens,
-    });
+    let result;
+    try {
+      result = await providers().llm.chat({
+        model: config.llmModel,
+        systemPrompt: persona.systemPrompt,
+        messages,
+        maxTokens: config.maxReplyTokens,
+      });
+    } catch (err) {
+      releaseBudget("llmTokens", estimatedTokens);
+      throw err;
+    }
 
-    recordLlmUsage(result.inputTokens + result.outputTokens);
+    settleBudget("llmTokens", estimatedTokens, result.inputTokens + result.outputTokens);
 
-    const reply = applyCrisisBackstop(lastUserMessage, result.text).slice(
-      0,
-      config.maxSpokenChars
-    );
-    const replyToken = issueReplyToken(persona.id, reply);
+    const reply = result.text.slice(0, config.maxSpokenChars);
+    const replyToken = issueReplyToken(persona.id, reply, sessionId);
 
     logRequest({
       route,
@@ -117,4 +147,10 @@ export async function POST(req: NextRequest) {
     logRequest({ route, status: 500, sessionId });
     return errorResponse(500, "internal_error", "Something went wrong.");
   }
+}
+
+export async function POST(req: NextRequest) {
+  const session = resolveSession(req);
+  const res = await handle(req, session.sessionId);
+  return attachSessionCookie(res, session);
 }

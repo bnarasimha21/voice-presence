@@ -27,6 +27,7 @@ export class ElevenLabsTtsProvider implements TtsProvider {
               similarity_boost: 0.8,
             },
           }),
+          signal: req.signal,
         }
       );
     } catch (err) {
