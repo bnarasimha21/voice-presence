@@ -12,7 +12,7 @@
 // rejected), so a captured token cannot be replayed to re-bill TTS
 // synthesis indefinitely.
 
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { config } from "@/lib/config";
 
 export type ReplyTokenPayload = {
@@ -28,6 +28,31 @@ export type ReplyTokenPayload = {
   // /api/chat, never by the client) lets /api/tts skip the budget check
   // for exactly this one case, the same way /api/chat already does.
   isCrisis: boolean;
+  // Finding 4 (third adversarial review): without a nonce, identical
+  // personaId+text+sessionId inputs minted within the same millisecond
+  // (exp is derived from Date.now(), so two tokens issued in the same ms
+  // are byte-for-byte identical) produced the exact same token string.
+  // markTokenRedeemed then rejected the second as a replay of the first,
+  // so concurrent legitimate requests on the same session (most acutely:
+  // several concurrent crisis triggers on one session, or one shared-IP
+  // session after the earlier session-identity fix) could lose all but
+  // one of them to a false "already used" rejection. A random nonce
+  // makes every issued token unique regardless of how many are minted in
+  // the same millisecond for the same persona/text/session.
+  //
+  // Finding 6 (fourth adversarial review): making this field required in
+  // verifyReplyToken's malformed-check would reject any token minted by
+  // the previous version of this code (no nonce field at all) as
+  // malformed, for as long as that token's TTL (replyTokenTtlMs, default
+  // 2 minutes). During a deploy, a crisis reply token issued by an
+  // old-code instance just before cutover could then fail to redeem for
+  // audio against a new-code instance right after, silencing the safety
+  // reply's audio for an unlucky few minutes. The field stays required
+  // on *new* tokens (issueReplyToken always sets it) but verification
+  // below treats a missing nonce as "" rather than malformed, so an
+  // old-format token already in flight still verifies; it just never
+  // collides with anything because it is the only token like it.
+  nonce?: string;
 };
 
 function secret(): string {
@@ -55,6 +80,7 @@ export function issueReplyToken(
     sessionId,
     exp: Date.now() + config.replyTokenTtlMs,
     isCrisis,
+    nonce: randomBytes(9).toString("base64url"),
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const sig = sign(payloadB64);
@@ -98,12 +124,13 @@ export function verifyReplyToken(token: string): VerifyResult {
     typeof payload.text !== "string" ||
     typeof payload.personaId !== "string" ||
     typeof payload.sessionId !== "string" ||
-    typeof payload.isCrisis !== "boolean"
+    typeof payload.isCrisis !== "boolean" ||
+    (payload.nonce !== undefined && typeof payload.nonce !== "string")
   ) {
     return { ok: false, reason: "malformed" };
   }
 
-  return { ok: true, payload };
+  return { ok: true, payload: { ...payload, nonce: payload.nonce ?? "" } };
 }
 
 // ---- Single-use redemption ------------------------------------------------

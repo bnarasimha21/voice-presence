@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createHmac } from "crypto";
 import {
   issueReplyToken,
   markTokenRedeemed,
@@ -96,6 +97,64 @@ describe("turn-token", () => {
       if (!verifiedA.ok || !verifiedB.ok) return;
       expect(markTokenRedeemed(tokenA, verifiedA.payload.exp)).toBe(true);
       expect(markTokenRedeemed(tokenB, verifiedB.payload.exp)).toBe(true);
+    });
+
+    it("finding 4: concurrent tokens minted with identical personaId/text/sessionId do not collide", () => {
+      // Before the nonce fix, issueReplyToken's payload was a pure
+      // function of (personaId, text, sessionId, exp, isCrisis), and exp
+      // is derived from Date.now(); several tokens minted in the same
+      // millisecond for the same persona/text/session (the exact shape
+      // of concurrent crisis triggers on one session) were byte-for-byte
+      // identical, so markTokenRedeemed rejected every one after the
+      // first as a "replay". Freeze time so every token below really is
+      // minted in the same millisecond, the worst case this guards
+      // against.
+      vi.useFakeTimers();
+      try {
+        const tokens = Array.from({ length: 5 }, () =>
+          issueReplyToken("abhi", "I'm concerned about what you just shared.", "session-concurrent", true)
+        );
+        // Distinct tokens despite identical inputs and identical mint time.
+        expect(new Set(tokens).size).toBe(5);
+
+        const results = tokens.map((token) => {
+          const verified = verifyReplyToken(token);
+          if (!verified.ok) return false;
+          return markTokenRedeemed(token, verified.payload.exp);
+        });
+        // All five legitimate, concurrent redemptions succeed; none is
+        // rejected as a replay of another.
+        expect(results.every(Boolean)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("finding 6: a correctly-signed token minted without a nonce field still verifies (old-code compatibility)", () => {
+      // Simulates a token minted by the pre-nonce version of
+      // issueReplyToken, still in flight (within its own TTL) against
+      // the current verifyReplyToken: it must still be redeemable, not
+      // rejected as "malformed", or a crisis reply token issued right
+      // before a deploy could lose its audio right after.
+      const payload = {
+        personaId: "abhi",
+        text: "I'm concerned about what you just shared.",
+        sessionId: "session-a",
+        exp: Date.now() + 60_000,
+        isCrisis: true,
+        // no `nonce` field at all
+      };
+      const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+      const sig = createHmac("sha256", process.env.TURN_SECRET as string)
+        .update(payloadB64)
+        .digest("base64url");
+      const oldStyleToken = `${payloadB64}.${sig}`;
+
+      const result = verifyReplyToken(oldStyleToken);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.payload.nonce).toBe("");
+      expect(markTokenRedeemed(oldStyleToken, result.payload.exp)).toBe(true);
     });
 
     it("sweeps an expired redemption record so it does not grow forever", () => {
