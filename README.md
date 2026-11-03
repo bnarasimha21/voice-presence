@@ -71,9 +71,14 @@ response header.
 `lib/limits.ts`: a token-bucket rate limit per session per route, a per-session
 turn cap, and a UTC-day usage budget across LLM tokens, STT seconds, and TTS
 characters that 429s all three routes once exceeded. `lib/config.ts` is the
-single place every limit, model id, and timeout is read from. `middleware.ts`
+single place every limit, model id, and timeout is read from. `proxy.ts`
 gates every `/api/*` and `/talk` request behind a shared access code when
-`ACCESS_CODE` is set (signed cookie, `timingSafeEqual` comparison).
+`ACCESS_CODE` is set (signed cookie, `timingSafeEqual` comparison on a
+hashed digest of the code, never the code itself in the cookie). The code
+is not a secret boundary on its own: without HTTPS in front of this app,
+both the `?code=` link and the cookie it sets travel in the clear. With
+`NODE_ENV=production` and no `ACCESS_CODE` set, the gate fails closed
+(every request denied) rather than opening for everyone.
 
 None of this is horizontally scalable: it is in-memory, per-instance state,
 which is fine for the single instance this app runs on. A shared store
