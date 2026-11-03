@@ -76,6 +76,24 @@ const CRISIS_PATTERNS: RegExp[] = [
   /\bwan+a\s+die\b/,
   /\bwant\s+2\s+die\b/,
   /\bgonna\s+end\s+it\b/,
+  // Finding 3 (third adversarial review): common SPOKEN English
+  // phrasings a real speech-to-text provider would actually produce,
+  // which the first two rounds missed.
+  /\bshoot\s*my\s*self\b/,
+  /\bstab\s*my\s*self\b/,
+  /\bdrown(?:ing|ed)?\s*my\s*self\b/,
+  /\boff\s+my\s*self\b/,
+  /\bwant(?:ed|s|ing)?\s+to\s+end\s+it\b/,
+  /\bthinking\s+(?:about|of)\s+ending\s+it\b/,
+  /\bdon\s*'?\s*t\s+wan+a\s+live\b/,
+  /\bdon\s*'?\s*t\s+want\s+to\s+be\s+here\s+anymore\b/,
+  /\bsleep\s+and\s+never\s+wake\s+up\b/,
+  /\bwon\s*'?\s*t\s+be\s+around\s+much\s+longer\b/,
+  // Adversarial-review follow-up (fourth pass): "wanna"/"gonna" casual
+  // contractions of two of the phrasings just above, same style already
+  // used for "wan+a die" and "gonna end it".
+  /\bwan+a\s+end\s+it\b/,
+  /\bgonna\s+off\s+my\s*self\b/,
   // Indirect phrasing aimed at a deceased-loved-one persona: imperfect by
   // nature (it can both over- and under-match depending on context the
   // detector does not have), included anyway because the backstop is

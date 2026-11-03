@@ -156,6 +156,42 @@ describe("matchesCrisisPhrase", () => {
     });
   });
 
+  // Finding 3 (third adversarial review): common SPOKEN English
+  // phrasings a real speech-to-text provider would actually produce.
+  describe("finding 3: previously-missed spoken English phrasings", () => {
+    const cases: [string, string][] = [
+      ["going to shoot myself", "I'm going to shoot myself"],
+      ["want to stab myself", "I want to stab myself"],
+      ["drown myself", "I'm going to drown myself"],
+      ["off myself", "I want to off myself"],
+      ["want to end it", "I want to end it"],
+      ["thinking about ending it", "I've been thinking about ending it"],
+      ["dont wanna live", "I dont wanna live"],
+      ["don't want to be here anymore", "I don't want to be here anymore"],
+      ["sleep and never wake up", "I want to sleep and never wake up"],
+      ["won't be around much longer", "I won't be around much longer"],
+    ];
+    for (const [label, phrase] of cases) {
+      it(`matches: ${label}`, () => {
+        expect(matchesCrisisPhrase(phrase)).toBe(true);
+      });
+    }
+  });
+
+  // Adversarial-review follow-up (fourth pass): casual "wanna"/"gonna"
+  // contractions of two of the finding-3 phrasings above, which the
+  // original /\bwant(?:ed|s|ing)?\s+to\s+end\s+it\b/ and
+  // /\boff\s+my\s*self\b/-via-"gonna" paths did not cover.
+  describe("finding 8: casual contraction variants of finding 3 phrasings", () => {
+    it("matches 'wanna end it'", () => {
+      expect(matchesCrisisPhrase("I just wanna end it")).toBe(true);
+    });
+
+    it("matches 'gonna off myself'", () => {
+      expect(matchesCrisisPhrase("I'm gonna off myself")).toBe(true);
+    });
+  });
+
   describe("finding 1: benign text still does not trip", () => {
     it("does not match an ordinary rough day", () => {
       expect(matchesCrisisPhrase("I had a rough day at work")).toBe(false);
