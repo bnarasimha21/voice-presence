@@ -29,8 +29,30 @@ const ACCESS_COOKIE = "vp_access";
 // a fixed, non-secret marker; the HMAC over it is what's secret.
 const GRANT_VALUE = "granted";
 
+// Finding 5 (adversarial review, second pass): the signature used to be
+// over GRANT_VALUE alone, with a secret independent of ACCESS_CODE. That
+// meant rotating ACCESS_CODE (the actual response to a leaked code) did
+// nothing to the cookies already issued under the old code: every
+// browser that already had one stayed "granted" forever, since the
+// signature it carries verifies against the same accessCookieSecret
+// either way. Folding a hash of the access code actually in effect into
+// the signed payload (never into the visible cookie value, so the
+// plaintext code still never appears in a cookie or a log) means a
+// cookie's signature only verifies against the code that was current
+// when it was issued: changing ACCESS_CODE changes what every future
+// validCookie call hashes and signs against, so every previously issued
+// cookie stops verifying immediately, without needing to track or revoke
+// anything issued.
 function sign(value: string, secret: string): string {
   return createHmac("sha256", secret).update(value).digest("base64url");
+}
+
+function codeFingerprint(accessCode: string): string {
+  return createHash("sha256").update(accessCode).digest("base64url");
+}
+
+function signedPayload(accessCode: string): string {
+  return `${GRANT_VALUE}.${codeFingerprint(accessCode)}`;
 }
 
 // A plain `===` on the supplied code leaks timing information proportional
@@ -45,15 +67,19 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(aHash, bHash);
 }
 
-function issueCookieValue(secret: string): string {
-  return `${GRANT_VALUE}.${sign(GRANT_VALUE, secret)}`;
+function issueCookieValue(secret: string, accessCode: string): string {
+  return `${GRANT_VALUE}.${sign(signedPayload(accessCode), secret)}`;
 }
 
-function validCookie(cookieValue: string | undefined, secret: string): boolean {
+function validCookie(
+  cookieValue: string | undefined,
+  secret: string,
+  accessCode: string
+): boolean {
   if (!cookieValue) return false;
   const [value, sig] = cookieValue.split(".");
   if (value !== GRANT_VALUE || !sig) return false;
-  const expected = sign(GRANT_VALUE, secret);
+  const expected = sign(signedPayload(accessCode), secret);
   const expectedBuf = Buffer.from(expected);
   const sigBuf = Buffer.from(sig);
   if (expectedBuf.length !== sigBuf.length) return false;
@@ -88,7 +114,7 @@ export async function proxy(req: NextRequest) {
   }
 
   const existing = req.cookies.get(ACCESS_COOKIE)?.value;
-  if (validCookie(existing, appConfig.accessCookieSecret)) return NextResponse.next();
+  if (validCookie(existing, appConfig.accessCookieSecret, accessCode)) return NextResponse.next();
 
   const suppliedCode = req.nextUrl.searchParams.get("code");
   if (suppliedCode !== null && constantTimeEqual(suppliedCode, accessCode)) {
@@ -101,7 +127,7 @@ export async function proxy(req: NextRequest) {
     const cleanUrl = new URL(req.nextUrl);
     cleanUrl.searchParams.delete("code");
     const res = NextResponse.redirect(cleanUrl);
-    res.cookies.set(ACCESS_COOKIE, issueCookieValue(appConfig.accessCookieSecret), {
+    res.cookies.set(ACCESS_COOKIE, issueCookieValue(appConfig.accessCookieSecret, accessCode), {
       httpOnly: true,
       sameSite: "lax",
       secure: true,
